@@ -10,6 +10,8 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn, error};
 use std::sync::Arc;
 use std::path::Path;
+use rust_decimal::Decimal;
+// use rust_decimal::prelude::*;
 
 /// Configuration for data collection
 #[derive(Clone)]
@@ -148,20 +150,24 @@ pub async fn run_data_collection_task(
 
                 // Get best bid/ask from maintained orderbook state (properly handles DELTA updates)
                 if let Some((bid_price, ask_price)) = orderbook_state.get_best_bid_ask() {
-                    let mid = (bid_price + ask_price) / 2.0;
+                    let mid = (bid_price + ask_price) / Decimal::from(2);
                     let spread = ask_price - bid_price;
-                    let spread_pct = (spread / mid) * 100.0;
+                    let spread_pct = if mid.is_zero() {
+                        Decimal::ZERO
+                    } else {
+                        (spread / mid) * Decimal::from(100)
+                    };
 
                     // Log WebSocket prices every 2 seconds
                     if last_log.elapsed().as_secs() >= 2 {
-                        if spread > 2.0 {
+                        if spread > Decimal::new(2, 0) {
                             warn!(
-                                "WebSocket {} for {}: Bid ${:.2} | Ask ${:.2} | Mid ${:.2} | Spread ${:.2} ({:.2}%) - Larger than typical",
+                                "WebSocket {} for {}: Bid {} | Ask {} | Mid {} | Spread {} ({}%) - Larger than typical",
                                 msg.message_type, market, bid_price, ask_price, mid, spread, spread_pct
                             );
                         } else {
                             info!(
-                                "WebSocket {} for {}: Bid ${:.2} | Ask ${:.2} | Mid ${:.2} | Spread ${:.2} ({:.2}%)",
+                                "WebSocket {} for {}: Bid {} | Ask {} | Mid {} | Spread {} ({}%)",
                                 msg.message_type, market, bid_price, ask_price, mid, spread, spread_pct
                             );
                         }

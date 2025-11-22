@@ -18,7 +18,7 @@
 /// The service can be interrupted and restarted - it will resume from where
 /// it left off and avoid duplicates.
 use extended_data_collector::{
-    init_logging, OrderbookCsvWriter, TradesCsvWriter, WebSocketClient,
+    init_logging, FullOrderbookCsvWriter, TradesCsvWriter, WebSocketClient,
 };
 use serde::Deserialize;
 use std::fs;
@@ -62,7 +62,7 @@ impl Config {
 struct MarketCollector {
     market: String,
     trades_writer: Option<Arc<TradesCsvWriter>>,
-    orderbook_writer: Option<Arc<OrderbookCsvWriter>>,
+    orderbook_writer: Option<Arc<FullOrderbookCsvWriter>>,
 }
 
 impl MarketCollector {
@@ -79,7 +79,8 @@ impl MarketCollector {
         };
 
         let orderbook_writer = if collect_orderbook {
-            Some(Arc::new(OrderbookCsvWriter::new(data_dir, &market)?))
+            // Use 20 levels as requested
+            Some(Arc::new(FullOrderbookCsvWriter::new(data_dir, &market, 20)?))
         } else {
             None
         };
@@ -149,12 +150,12 @@ impl MarketCollector {
             println!("📈 Starting full orderbook collection for {}", self.market);
 
             let mut rx = ws_client.subscribe_full_orderbook(&self.market).await?;
-            let writer: Arc<OrderbookCsvWriter> = Arc::clone(writer);
+            let writer: Arc<FullOrderbookCsvWriter> = Arc::clone(writer);
 
             tokio::spawn(async move {
                 let mut count = 0;
                 while let Some(msg) = rx.recv().await {
-                    if let Err(e) = writer.write_orderbook(&msg).await {
+                    if let Err(e) = writer.write_full_orderbook(&msg).await {
                         eprintln!("Error writing orderbook: {}", e);
                     } else {
                         count += 1;

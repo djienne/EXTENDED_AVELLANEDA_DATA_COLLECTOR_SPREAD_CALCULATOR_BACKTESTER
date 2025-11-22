@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::cmp::Reverse;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
+use std::str::FromStr;
 
 /// State tracking for resuming data collection
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,7 +73,11 @@ impl CollectorState {
 
 /// Minimum quantity threshold to avoid floating-point precision issues
 /// Quantities below this are considered zero and removed from the orderbook
-const MIN_QUANTITY_THRESHOLD: f64 = 1e-9;
+// const MIN_QUANTITY_THRESHOLD: f64 = 1e-9;
+// Using a very small decimal for threshold (1e-9)
+fn min_quantity_threshold() -> Decimal {
+    Decimal::new(1, 9)
+}
 
 /// Orderbook state manager for handling SNAPSHOT and DELTA updates
 ///
@@ -80,25 +87,13 @@ const MIN_QUANTITY_THRESHOLD: f64 = 1e-9;
 #[derive(Debug, Clone)]
 pub struct OrderbookState {
     /// Bids: price -> quantity (sorted descending - highest first)
-    pub bids: BTreeMap<Reverse<OrderedFloat>, f64>,
+    pub bids: BTreeMap<Reverse<Decimal>, Decimal>,
     /// Asks: price -> quantity (sorted ascending - lowest first)
-    pub asks: BTreeMap<OrderedFloat, f64>,
+    pub asks: BTreeMap<Decimal, Decimal>,
     /// Market name
     pub market: String,
     /// Last sequence number
     pub seq: u64,
-}
-
-/// Wrapper for f64 that implements Ord for use in BTreeMap
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct OrderedFloat(f64);
-
-impl Eq for OrderedFloat {}
-
-impl Ord for OrderedFloat {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.partial_cmp(&other.0).unwrap_or(std::cmp::Ordering::Equal)
-    }
 }
 
 impl OrderbookState {
@@ -123,27 +118,27 @@ impl OrderbookState {
 
         // Process bids
         for level in &msg.data.b {
-            let price = level.p.parse::<f64>().unwrap_or(0.0);
-            let qty_value = level.q.parse::<f64>().unwrap_or(0.0);
+            let price = Decimal::from_str(&level.p).unwrap_or(Decimal::ZERO);
+            let qty_value = Decimal::from_str(&level.q).unwrap_or(Decimal::ZERO);
 
-            if price <= 0.0 {
+            if price <= Decimal::ZERO {
                 continue;
             }
 
             if is_snapshot {
                 // SNAPSHOT: absolute quantity - replace level
-                if qty_value > MIN_QUANTITY_THRESHOLD {
-                    self.bids.insert(Reverse(OrderedFloat(price)), qty_value);
+                if qty_value > min_quantity_threshold() {
+                    self.bids.insert(Reverse(price), qty_value);
                 } else {
-                    self.bids.remove(&Reverse(OrderedFloat(price)));
+                    self.bids.remove(&Reverse(price));
                 }
             } else {
                 // DELTA: change in quantity - add to existing level
-                let key = Reverse(OrderedFloat(price));
-                let current_qty = self.bids.get(&key).copied().unwrap_or(0.0);
+                let key = Reverse(price);
+                let current_qty = self.bids.get(&key).copied().unwrap_or(Decimal::ZERO);
                 let new_qty = current_qty + qty_value;
 
-                if new_qty > MIN_QUANTITY_THRESHOLD {
+                if new_qty > min_quantity_threshold() {
                     self.bids.insert(key, new_qty);
                 } else {
                     // Quantity went to zero or negative - remove level
@@ -154,27 +149,27 @@ impl OrderbookState {
 
         // Process asks
         for level in &msg.data.a {
-            let price = level.p.parse::<f64>().unwrap_or(0.0);
-            let qty_value = level.q.parse::<f64>().unwrap_or(0.0);
+            let price = Decimal::from_str(&level.p).unwrap_or(Decimal::ZERO);
+            let qty_value = Decimal::from_str(&level.q).unwrap_or(Decimal::ZERO);
 
-            if price <= 0.0 {
+            if price <= Decimal::ZERO {
                 continue;
             }
 
             if is_snapshot {
                 // SNAPSHOT: absolute quantity - replace level
-                if qty_value > MIN_QUANTITY_THRESHOLD {
-                    self.asks.insert(OrderedFloat(price), qty_value);
+                if qty_value > min_quantity_threshold() {
+                    self.asks.insert(price, qty_value);
                 } else {
-                    self.asks.remove(&OrderedFloat(price));
+                    self.asks.remove(&price);
                 }
             } else {
                 // DELTA: change in quantity - add to existing level
-                let key = OrderedFloat(price);
-                let current_qty = self.asks.get(&key).copied().unwrap_or(0.0);
+                let key = price;
+                let current_qty = self.asks.get(&key).copied().unwrap_or(Decimal::ZERO);
                 let new_qty = current_qty + qty_value;
 
-                if new_qty > MIN_QUANTITY_THRESHOLD {
+                if new_qty > min_quantity_threshold() {
                     self.asks.insert(key, new_qty);
                 } else {
                     // Quantity went to zero or negative - remove level
@@ -185,12 +180,12 @@ impl OrderbookState {
     }
 
     /// Get best bid and ask prices
-    pub fn get_best_bid_ask(&self) -> Option<(f64, f64)> {
-        let best_bid = self.bids.iter().next().map(|(Reverse(OrderedFloat(p)), _)| *p)?;
-        let best_ask = self.asks.iter().next().map(|(OrderedFloat(p), _)| *p)?;
+    pub fn get_best_bid_ask(&self) -> Option<(Decimal, Decimal)> {
+        let best_bid = self.bids.iter().next().map(|(Reverse(p), _)| *p)?;
+        let best_ask = self.asks.iter().next().map(|(p, _)| *p)?;
 
         // Sanity check
-        if best_bid > 0.0 && best_ask > 0.0 && best_bid < best_ask {
+        if best_bid > Decimal::ZERO && best_ask > Decimal::ZERO && best_bid < best_ask {
             Some((best_bid, best_ask))
         } else {
             None
@@ -198,9 +193,9 @@ impl OrderbookState {
     }
 
     /// Get mid price
-    pub fn mid_price(&self) -> Option<f64> {
+    pub fn mid_price(&self) -> Option<Decimal> {
         let (bid, ask) = self.get_best_bid_ask()?;
-        Some((bid + ask) / 2.0)
+        Some((bid + ask) / Decimal::from(2))
     }
 }
 
@@ -530,15 +525,15 @@ impl OrderbookCsvWriter {
         let best_ask = best_ask_opt.unwrap();
 
         // Parse prices for calculations
-        let bid_price: f64 = best_bid.p.parse().unwrap_or(0.0);
-        let ask_price: f64 = best_ask.p.parse().unwrap_or(0.0);
-        let bid_qty: f64 = best_bid.q.parse().unwrap_or(0.0);
-        let ask_qty: f64 = best_ask.q.parse().unwrap_or(0.0);
+        let bid_price = Decimal::from_str(&best_bid.p).unwrap_or(Decimal::ZERO);
+        let ask_price = Decimal::from_str(&best_ask.p).unwrap_or(Decimal::ZERO);
+        let bid_qty = Decimal::from_str(&best_bid.q).unwrap_or(Decimal::ZERO);
+        let ask_qty = Decimal::from_str(&best_ask.q).unwrap_or(Decimal::ZERO);
 
         // Sanity check: bid should always be lower than ask
         if bid_price >= ask_price {
             warn!(
-                "Invalid orderbook for {}: bid ${:.2} >= ask ${:.2} (seq: {}). Skipping.",
+                "Invalid orderbook for {}: bid {} >= ask {} (seq: {}). Skipping.",
                 msg.data.m, bid_price, ask_price, msg.seq
             );
             *last_seq = Some(msg.seq);
@@ -548,12 +543,12 @@ impl OrderbookCsvWriter {
         }
 
         // Calculate mid price and spread
-        let mid_price = (bid_price + ask_price) / 2.0;
+        let mid_price = (bid_price + ask_price) / Decimal::from(2);
         let spread = ask_price - bid_price;
-        let spread_bps = if mid_price > 0.0 {
-            (spread / mid_price) * 10000.0
+        let spread_bps = if mid_price > Decimal::ZERO {
+            (spread / mid_price) * Decimal::from(10000)
         } else {
-            0.0
+            Decimal::ZERO
         };
 
         // Format timestamp
@@ -577,7 +572,7 @@ impl OrderbookCsvWriter {
         // Write orderbook data - unified format with bid and ask together
         writeln!(
             writer,
-            "{},{},{},{},{},{},{},{},{},{:.8},{:.8}",
+            "{},{},{},{},{},{},{},{},{},{},{}",
             msg.ts,
             datetime,
             msg.data.m,
@@ -732,16 +727,16 @@ impl FullOrderbookCsvWriter {
         orderbook.apply_update(msg);
 
         // Extract top N levels from sorted orderbook, filtering out tiny quantities
-        let bids: Vec<(f64, f64)> = orderbook.bids.iter()
-            .filter(|(_, &q)| q > MIN_QUANTITY_THRESHOLD)
+        let bids: Vec<(Decimal, Decimal)> = orderbook.bids.iter()
+            .filter(|(_, &q)| q > min_quantity_threshold())
             .take(self.max_levels)
-            .map(|(Reverse(OrderedFloat(p)), q)| (*p, *q))
+            .map(|(Reverse(p), q)| (*p, *q))
             .collect();
 
-        let asks: Vec<(f64, f64)> = orderbook.asks.iter()
-            .filter(|(_, &q)| q > MIN_QUANTITY_THRESHOLD)
+        let asks: Vec<(Decimal, Decimal)> = orderbook.asks.iter()
+            .filter(|(_, &q)| q > min_quantity_threshold())
             .take(self.max_levels)
-            .map(|(OrderedFloat(p), q)| (*p, *q))
+            .map(|(p, q)| (*p, *q))
             .collect();
 
         // Skip if we don't have both bids and asks
@@ -775,8 +770,8 @@ impl FullOrderbookCsvWriter {
         let mut row = format!("{},{},{},{}", msg.ts, datetime, msg.data.m, msg.seq);
 
         for level in 0..self.max_levels {
-            let (bid_price, bid_qty) = bids.get(level).copied().unwrap_or((0.0, 0.0));
-            let (ask_price, ask_qty) = asks.get(level).copied().unwrap_or((0.0, 0.0));
+            let (bid_price, bid_qty) = bids.get(level).copied().unwrap_or((Decimal::ZERO, Decimal::ZERO));
+            let (ask_price, ask_qty) = asks.get(level).copied().unwrap_or((Decimal::ZERO, Decimal::ZERO));
 
             row.push_str(&format!(",{},{},{},{}", bid_price, bid_qty, ask_price, ask_qty));
         }
@@ -827,7 +822,7 @@ impl FullOrderbookCsvWriter {
 
     /// Get best bid and ask prices from maintained orderbook state
     /// Returns (best_bid_price, best_ask_price) or None if state not initialized
-    pub async fn get_best_bid_ask(&self) -> Option<(f64, f64)> {
+    pub async fn get_best_bid_ask(&self) -> Option<(Decimal, Decimal)> {
         let ob_state = self.orderbook_state.lock().await;
 
         if let Some(orderbook) = ob_state.as_ref() {
