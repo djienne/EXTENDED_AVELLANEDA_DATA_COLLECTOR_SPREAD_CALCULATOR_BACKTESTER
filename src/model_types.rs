@@ -13,6 +13,7 @@ pub enum GammaMode {
 
 /// Configuration for the Avellaneda-Stoikov calculator
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct ASConfig {
     pub risk_aversion_gamma: f64,
     pub effective_volume_threshold: Decimal,
@@ -31,6 +32,7 @@ pub struct ASConfig {
     pub taker_fee_bps: f64,
     pub min_volatility: f64,
     pub max_volatility: f64,
+    pub fill_cooldown_seconds: u64,
 }
 
 impl Default for ASConfig {
@@ -54,6 +56,7 @@ impl Default for ASConfig {
             taker_fee_bps: 5.0,
             min_volatility: 0.0,
             max_volatility: 0.02,
+            fill_cooldown_seconds: 0,
         }
     }
 }

@@ -13,7 +13,25 @@ use std::io::Write;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load Config
-    let config = ASConfig::default(); // Use defaults for now, or load from file
+    let config_path = "config.json";
+    let config = match std::fs::read_to_string(config_path) {
+        Ok(contents) => {
+            match serde_json::from_str::<ASConfig>(&contents) {
+                Ok(cfg) => {
+                    println!("Loaded config from {}", config_path);
+                    cfg
+                },
+                Err(e) => {
+                    eprintln!("Error parsing config.json: {}. Using defaults.", e);
+                    ASConfig::default()
+                }
+            }
+        },
+        Err(_) => {
+            println!("config.json not found. Using defaults.");
+            ASConfig::default()
+        }
+    };
     println!("Using Config: {:?}", config);
 
     // 2. Load Data
