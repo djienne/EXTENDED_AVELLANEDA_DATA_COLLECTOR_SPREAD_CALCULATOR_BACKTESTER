@@ -1,7 +1,9 @@
 # Extended DEX Data Collector & Backtester
 
 ## Objective
-This project is designed to collect high-frequency market data from **Extended DEX** and explore optimal spread calculations using the **Avellaneda-Stoikov (AS)** market-making model. It provides a robust framework for capturing real-time orderbook and trade data, calibrating model parameters ($\gamma$, $\kappa$, $\sigma$), and backtesting strategies with realistic constraints.
+This project is designed to collect high-frequency market data from **Extended DEX** and explore optimal spread calculations using the **Avellaneda-Stoikov (AS)** market-making model.
+
+**Note**: The goal of this repository is **strictly for backtesting and research purposes**. It is **not** intended for live trading or execution strategies. It provides a robust framework for capturing real-time orderbook and trade data, calibrating model parameters ($\gamma$, $\kappa$, $\sigma$), and backtesting strategies with realistic constraints.
 
 ## Key Features
 
