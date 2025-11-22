@@ -25,7 +25,7 @@ This project is designed to collect high-frequency market data from **Extended D
 ## Usage
 
 ### Prerequisites
-*   Rust toolchain installed.
+*   Rust toolchain installed (version >1.91 recommended; may work with older versions but not tested).
 *   `config.json` configured (see below).
 
 ### 1. Collect Data
