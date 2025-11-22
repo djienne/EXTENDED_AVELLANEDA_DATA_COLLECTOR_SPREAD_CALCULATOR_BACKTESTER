@@ -28,6 +28,13 @@ This project is designed to collect high-frequency market data from **Extended D
 *   Rust toolchain installed (version >1.91 recommended; may work with older versions but not tested).
 *   `config.json` configured (see below).
 
+**Important**: You must collect data for a sufficient period before running backtests or spread calculations. The system requires historical data to:
+- Calibrate volatility ($\sigma$) and intensity parameters ($\kappa$, $A$)
+- Build a rolling window for dynamic parameter updates
+- Provide realistic market conditions for backtesting
+
+Recommended minimum: Several hours of data collection to ensure adequate calibration.
+
 ### 1. Collect Data
 Start collecting market data to `data/{market}/`:
 ```bash
