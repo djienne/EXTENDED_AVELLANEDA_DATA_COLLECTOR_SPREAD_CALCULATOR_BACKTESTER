@@ -11,5 +11,7 @@
   "collect_orderbook": true,
   "collect_trades": true,
   "collect_full_orderbook": true,
-  "max_depth_levels": 20
+  "max_depth_levels": 20,
+  "inventory_horizon_seconds": 3600,
+  "fill_cooldown_seconds": 30
 }

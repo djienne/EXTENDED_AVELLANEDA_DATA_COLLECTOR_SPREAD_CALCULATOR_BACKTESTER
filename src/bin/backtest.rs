@@ -1,10 +1,9 @@
 use extended_data_collector::calibration::{calculate_volatility, fit_intensity_parameters};
 use extended_data_collector::data_loader::DataLoader;
-use extended_data_collector::model_types::{ASConfig, TradeEvent};
+use extended_data_collector::model_types::ASConfig;
 use extended_data_collector::spread_model::compute_optimal_quote;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
-use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -17,6 +16,8 @@ struct BacktestState {
     bid_fills: u64,
     ask_fills: u64,
     total_volume: Decimal,  // Accumulated trading volume
+    last_bid_fill_ts: u64,  // Timestamp of the last bid fill
+    last_ask_fill_ts: u64,  // Timestamp of the last ask fill
 }
 
 impl BacktestState {
@@ -28,6 +29,8 @@ impl BacktestState {
             bid_fills: 0,
             ask_fills: 0,
             total_volume: Decimal::ZERO,
+            last_bid_fill_ts: 0,
+            last_ask_fill_ts: 0,
         }
     }
 
@@ -40,7 +43,25 @@ fn main() -> std::io::Result<()> {
     println!("Loading data...");
     
     // Load configuration
-    let config = ASConfig::default();
+    let config_path = "config.json";
+    let config = match std::fs::read_to_string(config_path) {
+        Ok(contents) => {
+            match serde_json::from_str::<ASConfig>(&contents) {
+                Ok(cfg) => {
+                    println!("Loaded config from {}", config_path);
+                    cfg
+                },
+                Err(e) => {
+                    eprintln!("Error parsing config.json: {}. Using defaults.", e);
+                    ASConfig::default()
+                }
+            }
+        },
+        Err(_) => {
+            println!("config.json not found. Using defaults.");
+            ASConfig::default()
+        }
+    };
     
     
     // Load data using DataLoader
@@ -51,21 +72,6 @@ fn main() -> std::io::Result<()> {
     
     let trades = loader.get_trades();
     let orderbooks: Vec<_> = loader.orderbooks_iter().map(|(_, ob)| ob.clone()).collect();
-
-    // Precompute per-second trade high/low to avoid repeated scans
-    let mut second_hilo: HashMap<u64, (Decimal, Decimal)> = HashMap::new();
-    for trade in trades.iter() {
-        let sec = trade.timestamp / 1000;
-        let entry = second_hilo
-            .entry(sec)
-            .or_insert((Decimal::ZERO, Decimal::from(999_999)));
-        if trade.price > entry.0 {
-            entry.0 = trade.price;
-        }
-        if trade.price < entry.1 {
-            entry.1 = trade.price;
-        }
-    }
     
     println!("Loaded {} orderbooks and {} trades", orderbooks.len(), trades.len());
     println!("Config: gamma_min={}, max_inventory={}, horizon={}s", 
@@ -83,7 +89,7 @@ fn main() -> std::io::Result<()> {
     
     let mut calibration_prices: Vec<(u64, Decimal)> = Vec::new();
     let mut window_prices: Vec<Decimal> = Vec::new();
-    let mut window_trades: Vec<TradeEvent> = Vec::new();
+    // window_trades is managed dynamically in the loop
     
     // Output file
     let mut output_file = File::create("data/ETH_USD/backtest_results.csv")?;
@@ -106,18 +112,97 @@ fn main() -> std::io::Result<()> {
     let mut last_ask = Decimal::ZERO;
     let mut last_mid = Decimal::ZERO;
     let mut row_count = 0;
-    let mut window_trade_idx: usize = 0;
     
+    // Event-driven loop state
+    let mut trade_idx = 0;
+    let mut active_bid_price: Option<Decimal> = None;
+    let mut active_ask_price: Option<Decimal> = None;
+    
+    // Constants for simulation
+    let max_inventory_decimal = Decimal::from_f64(config.max_inventory).unwrap_or(Decimal::from(10));
+    let fee_bps = Decimal::from_f64(config.maker_fee_bps).unwrap_or(Decimal::from(1));
+    let fee_multiplier = fee_bps / Decimal::from(10000);
+
     for (idx, quote) in orderbooks.iter().enumerate() {
         let current_ts = quote.timestamp;
-        let current_second_ts = current_ts / 1000; // Round down to second
-
-        let (second_high, second_low) = second_hilo
-            .get(&current_second_ts)
-            .cloned()
-            .unwrap_or((Decimal::ZERO, Decimal::from(999_999)));
         
-        // Calculate mid price from best bid/ask
+        // 1. Process trades that happened since the last orderbook update
+        // These trades execute against the quotes we set in the PREVIOUS iteration
+        while trade_idx < trades.len() && trades[trade_idx].timestamp < current_ts {
+            let trade = &trades[trade_idx];
+            
+            // Check cooldown
+            let cooldown_ms = config.fill_cooldown_seconds * 1000;
+            // Global cooldown check removed - now side specific
+            
+            // Only check for fills if we have active quotes
+            if let (Some(bid), Some(ask)) = (active_bid_price, active_ask_price) {
+                // SELL FILL: Market trade price >= our ask (someone bought from us)
+                if trade.price >= ask {
+                     // Check cooldown for ASK side
+                     if state.last_ask_fill_ts > 0 && trade.timestamp < state.last_ask_fill_ts + cooldown_ms {
+                         // Cooldown active, skip this fill
+                     } else if state.inventory > -max_inventory_decimal {
+                         // Check inventory limits (can't sell if already max short)
+                        // Calculate unit size from dollar notional
+                        let unit_size = order_notional / trade.price; 
+                        
+                        // Scale order size based on available capacity
+                        let short_capacity = state.inventory + max_inventory_decimal;
+                        let sell_size = short_capacity.min(unit_size).max(Decimal::ZERO);
+                        
+                        if sell_size > Decimal::ZERO {
+                            // Fill at our ask price (limit order)
+                            let fill_price = ask; 
+                            let gross_proceeds = fill_price * sell_size;
+                            let fee = gross_proceeds * fee_multiplier;
+                            
+                            state.inventory -= sell_size;
+                            state.cash += gross_proceeds - fee;
+                            state.ask_fills += 1;
+                            state.total_volume += sell_size;
+                            state.last_ask_fill_ts = trade.timestamp;
+                        }
+                    }
+                }
+                
+                // BUY FILL: Market trade price <= our bid (someone sold to us)
+                else if trade.price <= bid {
+                     // Check cooldown for BID side
+                     if state.last_bid_fill_ts > 0 && trade.timestamp < state.last_bid_fill_ts + cooldown_ms {
+                         // Cooldown active, skip this fill
+                     } else if state.inventory < max_inventory_decimal {
+                         // Check inventory limits (can't buy if already max long)
+                        // Calculate unit size from dollar notional
+                        let unit_size = order_notional / trade.price;
+                        
+                        // Scale order size based on available capacity
+                        let long_capacity = max_inventory_decimal - state.inventory;
+                        let buy_size = long_capacity.min(unit_size).max(Decimal::ZERO);
+                        
+                        if buy_size > Decimal::ZERO {
+                            let fill_price = bid;
+                            let gross_cost = fill_price * buy_size;
+                            let fee = gross_cost * fee_multiplier;
+                            let total_cost = gross_cost + fee;
+                            
+                            // Check cash constraint
+                            if state.cash >= total_cost {
+                                state.inventory += buy_size;
+                                state.cash -= total_cost;
+                                state.bid_fills += 1;
+                                state.total_volume += buy_size;
+                                state.last_bid_fill_ts = trade.timestamp;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            trade_idx += 1;
+        }
+
+        // 2. Update Market State with current orderbook
         let best_bid = quote.bids.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
         let best_ask = quote.asks.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
         let mid_price = if best_bid > Decimal::ZERO && best_ask > Decimal::ZERO {
@@ -130,18 +215,12 @@ fn main() -> std::io::Result<()> {
         last_ask = best_ask;
         last_mid = mid_price;
 
+        // 3. Calibration & Quoting for NEXT interval
         calibration_prices.push((current_ts, mid_price));
         window_prices.push(mid_price);
-
-        // Add new trades to window (FIX: Use only trades BEFORE current timestamp to avoid look-ahead bias)
-        while window_trade_idx < trades.len() && trades[window_trade_idx].timestamp < current_ts {
-            window_trades.push(trades[window_trade_idx].clone());
-            window_trade_idx += 1;
-        }
-
-        // Remove old data from windows
+        
+        // Maintenance
         calibration_prices.retain(|(ts, _)| *ts >= current_ts.saturating_sub(calibration_window_ms));
-        window_trades.retain(|t| t.timestamp >= current_ts.saturating_sub(calibration_window_ms));
         
         let should_calibrate = if let Some(last_cal_ts) = last_calibration_ts {
             current_ts >= last_cal_ts + recalibration_interval_ms
@@ -149,15 +228,27 @@ fn main() -> std::io::Result<()> {
             calibration_prices.len() >= 10
         };
         
+        let mut optimal_spread = Decimal::ZERO;
+        let mut optimal_gamma = 0.0;
+
         if should_calibrate && !calibration_prices.is_empty() {
+             // Find trades in window [current_ts - window, current_ts)
+             // Scan backwards from trade_idx (which is at current_ts)
+             let window_start_ts = current_ts.saturating_sub(calibration_window_ms);
+             let mut start_idx = trade_idx;
+             while start_idx > 0 && trades[start_idx - 1].timestamp >= window_start_ts {
+                 start_idx -= 1;
+             }
+             
+             let window_trades_slice = &trades[start_idx..trade_idx];
+            
             let start_ts = calibration_prices.first().map(|(ts, _)| *ts).unwrap_or(current_ts);
             let actual_duration_sec = ((current_ts - start_ts) as f64 / 1000.0).max(1.0);
             
-            let sigma_pct_raw = calculate_volatility(&window_prices, actual_duration_sec);
-            let sigma_pct = sigma_pct_raw;
+            let sigma_pct = calculate_volatility(&window_prices, actual_duration_sec);
             
             let (new_kappa, new_A) = fit_intensity_parameters(
-                &window_trades,
+                window_trades_slice,
                 &calibration_prices,
                 actual_duration_sec,
                 config.tick_size
@@ -177,76 +268,14 @@ fn main() -> std::io::Result<()> {
                 kappa,
                 &config,
             );
-            let bid_price = optimal.bid_price;
-            let ask_price = optimal.ask_price;
-            let optimal_spread = optimal.optimal_spread;
             
-            // Simulate fills using market high/low with realistic constraints
-            let max_inventory_decimal = Decimal::from_f64(config.max_inventory).unwrap_or(Decimal::from(10));
-            let fee_bps = Decimal::from_f64(config.maker_fee_bps).unwrap_or(Decimal::from(1));
-            let fee_multiplier = fee_bps / Decimal::from(10000);
+            // Set active quotes for the NEXT interval
+            active_bid_price = Some(optimal.bid_price);
+            active_ask_price = Some(optimal.ask_price);
+            optimal_spread = optimal.optimal_spread;
+            optimal_gamma = optimal.gamma;
             
-            let mut filled_this_second = false;
-            
-            // FIX P1: Prevent simultaneous fills (priority to sells first)
-            // FIX P0: Enforce inventory limits
-            // FIX P1: Use realistic fill prices (mid price for conservative estimate)
-            // FIX P0: Include transaction costs
-            
-            // SELL FILL: Market high >= our ask, aggressive buyers hit our ask -> WE SELL
-            if second_high > Decimal::ZERO && second_high >= ask_price {
-                // Check inventory limits (can't sell if already max short)
-                if state.inventory > -max_inventory_decimal {
-                    // Calculate unit size from dollar notional
-                    let unit_size = order_notional / mid_price;
-                    // Scale order size based on available capacity (P2 fix)
-                    let short_capacity = state.inventory + max_inventory_decimal;
-                    let sell_size = short_capacity.min(unit_size).max(Decimal::ZERO);
-                    
-                    if sell_size > Decimal::ZERO {
-                        // Use mid or our ask, whichever is more conservative (realistic pricing)
-                        let fill_price = ask_price.min(mid_price.max(ask_price));
-                        let gross_proceeds = fill_price * sell_size;
-                        let fee = gross_proceeds * fee_multiplier;
-                        
-                        state.inventory -= sell_size;
-                        state.cash += gross_proceeds - fee;
-                        state.ask_fills += 1;
-                        state.total_volume += sell_size;
-                        filled_this_second = true;
-                    }
-                }
-            }
-            
-            // BUY FILL: Market low <= our bid, aggressive sellers hit our bid -> WE BUY
-            if !filled_this_second && second_low < Decimal::from(999_999) && second_low <= bid_price {
-                // Check inventory limits (can't buy if already max long)
-                if state.inventory < max_inventory_decimal {
-                    // Calculate unit size from dollar notional
-                    let unit_size = order_notional / mid_price;
-                    // Scale order size based on available capacity (P2 fix)
-                    let long_capacity = max_inventory_decimal - state.inventory;
-                    let buy_size = long_capacity.min(unit_size).max(Decimal::ZERO);
-                    
-                    if buy_size > Decimal::ZERO {
-                        // Use mid or our bid, whichever is more conservative (realistic pricing)
-                        let fill_price = bid_price.max(mid_price.min(bid_price));
-                        let gross_cost = fill_price * buy_size;
-                        let fee = gross_cost * fee_multiplier;
-                        let total_cost = gross_cost + fee;
-                        
-                        // FIX P1: Check cash constraint
-                        if state.cash >= total_cost {
-                            state.inventory += buy_size;
-                            state.cash -= total_cost;
-                            state.bid_fills += 1;
-                            state.total_volume += buy_size;
-                        }
-                    }
-                }
-            }
-            
-            // Update P&L (FIX: Don't grow history unbounded, just track latest)
+            // Update P&L tracking
             let pnl = state.mark_to_market_pnl(mid_price);
             if state.pnl_history.is_empty() {
                 state.pnl_history.push(pnl);
@@ -255,11 +284,8 @@ fn main() -> std::io::Result<()> {
             }
             
             let spread_bps = (optimal_spread / mid_price) * Decimal::from(10000);
-            
-            // Round inventory for output (keep full precision internally)
             let inventory_display = state.inventory.round_dp(6);
             
-            // Output every recalibration (every minute based on config)
             writeln!(
                 output_file,
                 "{},{},{},{},{},{},{:.2},{},{},{},{},{:.6},{:.2}",
@@ -270,28 +296,22 @@ fn main() -> std::io::Result<()> {
                 state.cash,
                 pnl,
                 spread_bps.to_f64().unwrap_or(0.0),
-                bid_price,
-                ask_price,
+                optimal.bid_price,
+                optimal.ask_price,
                 state.bid_fills,
                 state.ask_fills,
                 optimal.gamma,
                 kappa
             )?;
             
-            // Print to console every 10 recalibrations to avoid spam
             if row_count % 10 == 0 {
-                // Round inventory for display (keep full precision internally)
-                let inventory_display = state.inventory.round_dp(6);
                 println!(
                     "{:<15} | {:>12.2} | {:>10} | {:>10.2} | {:>12.2} | {:>12.2} | {:>8} | {:>8}",
-                    current_ts, mid_price, inventory_display, pnl, bid_price, ask_price, state.bid_fills, state.ask_fills
+                    current_ts, mid_price, inventory_display, pnl, optimal.bid_price, optimal.ask_price, state.bid_fills, state.ask_fills
                 );
             }
-            
             row_count += 1;
         }
-        
-        // last_quote tracking not needed
     }
     
     // Force close any remaining position at final mid price
