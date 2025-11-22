@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git config:*)",
+      "Bash(git filter-branch:*)",
+      "Bash(git pull:*)",
+      "Bash(git fetch:*)",
+      "Bash(git reset:*)",
+      "Bash(git for-each-ref:*)",
+      "Bash(xargs:*)",
+      "Bash(git push:*)",
+      "Bash(FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch:*)",
+      "Bash(rm:*)",
+      "Bash(cargo check:*)",
+      "Bash(src/rest_temp.rs)",
+      "Bash(cargo fix:*)",
+      "Bash(cargo build:*)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "markets": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "XAU-USD",
+    "SPX-USD",
+    "EUR-USD"
+  ],
+  "data_directory": "data",
+  "collect_orderbook": true,
+  "collect_trades": true,
+  "collect_full_orderbook": true,
+  "max_depth_levels": 20
+}
