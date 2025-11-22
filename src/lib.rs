@@ -4,6 +4,11 @@ pub mod error;
 pub mod rest;
 pub mod types;
 pub mod websocket;
+pub mod model_types;
+pub mod data_loader;
+pub mod metrics;
+pub mod calibration;
+pub mod spread_model;
 
 // Re-export commonly used types
 pub use data_collection_task::{run_data_collection_task, DataCollectionConfig};
