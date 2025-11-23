@@ -95,25 +95,38 @@ impl MarketCollector {
     async fn collect_trades(&self, ws_client: &WebSocketClient) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &self.trades_writer {
             println!("📊 Starting trades collection for {}", self.market);
-
-            let mut rx = ws_client.subscribe_public_trades(&self.market).await?;
             let writer: Arc<TradesCsvWriter> = Arc::clone(writer);
+            let market = self.market.clone();
+            let ws_client = ws_client.clone();
 
             tokio::spawn(async move {
-                let mut count = 0;
-                while let Some(trade) = rx.recv().await {
-                    if let Err(e) = writer.write_trade(&trade).await {
-                        eprintln!("Error writing trade: {}", e);
-                    } else {
-                        count += 1;
-                        if count % 100 == 0 {
-                            let (total, last_id, last_ts) = writer.get_stats().await;
-                            println!(
-                                "✓ {} trades: {} total (last ID: {:?}, last TS: {:?})",
-                                trade.m, total, last_id, last_ts
-                            );
+                loop {
+                    println!("Connecting to trades stream for {}...", market);
+                    match ws_client.subscribe_public_trades(&market).await {
+                        Ok(mut rx) => {
+                            println!("✅ Connected to trades stream for {}", market);
+                            let mut count = 0;
+                            while let Some(trade) = rx.recv().await {
+                                if let Err(e) = writer.write_trade(&trade).await {
+                                    eprintln!("Error writing trade: {}", e);
+                                } else {
+                                    count += 1;
+                                    if count % 100 == 0 {
+                                        let (total, last_id, last_ts) = writer.get_stats().await;
+                                        println!(
+                                            "✓ {} trades: {} total (last ID: {:?}, last TS: {:?})",
+                                            trade.m, total, last_id, last_ts
+                                        );
+                                    }
+                                }
+                            }
+                            eprintln!("⚠️ Trades stream for {} ended unexpectedly. Reconnecting in 5s...", market);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to subscribe to trades for {}: {}. Retrying in 5s...", market, e);
                         }
                     }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
         }
@@ -148,25 +161,38 @@ impl MarketCollector {
     async fn collect_full_orderbook(&self, ws_client: &WebSocketClient) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &self.orderbook_writer {
             println!("📈 Starting full orderbook collection for {}", self.market);
-
-            let mut rx = ws_client.subscribe_full_orderbook(&self.market).await?;
             let writer: Arc<FullOrderbookCsvWriter> = Arc::clone(writer);
+            let market = self.market.clone();
+            let ws_client = ws_client.clone();
 
             tokio::spawn(async move {
-                let mut count = 0;
-                while let Some(msg) = rx.recv().await {
-                    if let Err(e) = writer.write_full_orderbook(&msg).await {
-                        eprintln!("Error writing orderbook: {}", e);
-                    } else {
-                        count += 1;
-                        if count % 100 == 0 {
-                            let (total, last_seq, last_ts) = writer.get_stats().await;
-                            println!(
-                                "✓ {} orderbook: {} total (last seq: {:?}, last TS: {:?})",
-                                msg.data.m, total, last_seq, last_ts
-                            );
+                loop {
+                    println!("Connecting to full orderbook stream for {}...", market);
+                    match ws_client.subscribe_full_orderbook(&market).await {
+                        Ok(mut rx) => {
+                            println!("✅ Connected to full orderbook stream for {}", market);
+                            let mut count = 0;
+                            while let Some(msg) = rx.recv().await {
+                                if let Err(e) = writer.write_full_orderbook(&msg).await {
+                                    eprintln!("Error writing orderbook: {}", e);
+                                } else {
+                                    count += 1;
+                                    if count % 100 == 0 {
+                                        let (total, last_seq, last_ts) = writer.get_stats().await;
+                                        println!(
+                                            "✓ {} orderbook: {} total (last seq: {:?}, last TS: {:?})",
+                                            msg.data.m, total, last_seq, last_ts
+                                        );
+                                    }
+                                }
+                            }
+                            eprintln!("⚠️ Full orderbook stream for {} ended unexpectedly. Reconnecting in 5s...", market);
+                        }
+                        Err(e) => {
+                            eprintln!("❌ Failed to subscribe to full orderbook for {}: {}. Retrying in 5s...", market, e);
                         }
                     }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
         }

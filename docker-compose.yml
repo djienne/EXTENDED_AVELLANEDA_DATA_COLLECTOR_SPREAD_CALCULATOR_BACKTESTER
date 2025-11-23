@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  collect_data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: extended_data_collector
+
+    # User mapping - runs as UID 1000 by default (defined in Dockerfile)
+    # Uncomment to override with your host user (Linux/Mac only)
+    # user: "${UID:-1000}:${GID:-1000}"
+
+    # Mount configuration and data volumes
+    volumes:
+      # Data directory - persists collected orderbook and trade data
+      - ./data:/app/data
+      # Configuration file - read-only
+      - ./config.json:/app/config.json:ro
+      # Environment file (optional) - read-only
+      - ./.env:/app/.env:ro
+
+    # Environment variables
+    environment:
+      # Logging level: trace, debug, info, warn, error
+      - RUST_LOG=${RUST_LOG:-debug}
+      # Extended environment: mainnet or testnet
+      - EXTENDED_ENV=${EXTENDED_ENV:-mainnet}
+
+    # Restart policy - always restart unless manually stopped
+    restart: unless-stopped
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Network mode
+    network_mode: bridge

@@ -9,6 +9,8 @@ pub mod data_loader;
 pub mod metrics;
 pub mod calibration;
 pub mod spread_model;
+pub mod backtest_engine;
+pub mod calibration_engine;
 
 // Re-export commonly used types
 pub use data_collection_task::{run_data_collection_task, DataCollectionConfig};

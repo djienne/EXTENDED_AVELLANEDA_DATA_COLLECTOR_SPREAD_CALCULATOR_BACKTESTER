@@ -432,8 +432,14 @@ impl OrderbookCsvWriter {
         // Check if we've seen this sequence before
         if let Some(prev_seq) = *last_seq {
             if msg.seq <= prev_seq {
-                debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
-                return Ok(());
+                // If it's a SNAPSHOT and seq is lower, it might be a reset/restart of the feed
+                if msg.message_type == "SNAPSHOT" {
+                    warn!("Received SNAPSHOT with lower seq ({} <= {}). Resetting sequence tracking.", msg.seq, prev_seq);
+                    // Allow it to proceed
+                } else {
+                    debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
+                    return Ok(());
+                }
             }
         }
 
@@ -703,8 +709,14 @@ impl FullOrderbookCsvWriter {
         // Check if we've seen this sequence before
         if let Some(prev_seq) = *last_seq {
             if msg.seq <= prev_seq {
-                debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
-                return Ok(());
+                // If it's a SNAPSHOT and seq is lower, it might be a reset/restart of the feed
+                if msg.message_type == "SNAPSHOT" {
+                    warn!("Received SNAPSHOT with lower seq ({} <= {}). Resetting sequence tracking.", msg.seq, prev_seq);
+                    // Allow it to proceed
+                } else {
+                    debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
+                    return Ok(());
+                }
             }
         }
 
