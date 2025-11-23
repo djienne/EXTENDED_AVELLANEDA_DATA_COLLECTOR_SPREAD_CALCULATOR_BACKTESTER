@@ -59,6 +59,9 @@ cargo run --bin calculate_spread
 *   `inventory_horizon_seconds`: Time horizon for the AS model (e.g., `3600` for 1 hour).
 *   `fill_cooldown_seconds`: Minimum time between fills on the same side (e.g., `30`).
 *   `risk_aversion_gamma`: Risk aversion parameter (default `0.1`).
+*   `gap_threshold_seconds`: Maximum allowed time between orderbook updates before triggering a warm-up period (default `1800`).
+*   `warmup_period_seconds`: Duration to pause trading and collect data after a gap or at start (default `900`).
+*   `quote_validity_seconds`: Maximum duration a quote remains valid without a new orderbook update (default `60`).
 
 ---
 *Note: This project is for research and backtesting purposes.*

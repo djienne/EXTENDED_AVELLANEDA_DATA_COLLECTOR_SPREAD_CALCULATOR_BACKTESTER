@@ -158,6 +158,10 @@ fn main() -> std::io::Result<()> {
                 active_ask_price = None;
                 active_quote_ts = 0;
             }
+        } else {
+            // Initial warm-up
+            warmup_end_ts = current_ts + warmup_period_ms;
+            println!("Starting initial warm-up until {}", format_timestamp(warmup_end_ts));
         }
         last_orderbook_ts = current_ts;
         
