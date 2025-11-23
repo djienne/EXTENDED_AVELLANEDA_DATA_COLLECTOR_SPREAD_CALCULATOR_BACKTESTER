@@ -7,6 +7,18 @@ use rust_decimal::prelude::*;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use chrono::{DateTime, Utc};
+
+/// Format timestamp (epoch milliseconds) as human-readable string with millisecond precision
+fn format_timestamp(timestamp_ms: u64) -> String {
+    let seconds = (timestamp_ms / 1000) as i64;
+    let nanos = ((timestamp_ms % 1000) * 1_000_000) as u32;
+    
+    match DateTime::<Utc>::from_timestamp(seconds, nanos) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S%.3f UTC").to_string(),
+        None => "N/A".to_string(),
+    }
+}
 
 #[derive(Debug, Clone)]
 struct BacktestState {
@@ -104,9 +116,9 @@ fn main() -> std::io::Result<()> {
     let mut last_calibration_ts: Option<u64> = None;
     
     // Print header
-    println!("\n{:<15} | {:>12} | {:>10} | {:>10} | {:>12} | {:>12} | {:>8} | {:>8}",
-        "Timestamp", "Mid Price", "Inventory", "PnL", "Bid", "Ask", "BidFill", "AskFill");
-    println!("{:-<120}", "");
+    println!("\n{:<15} | {:<24} | {:>12} | {:>10} | {:>10} | {:>12} | {:>12} | {:>8} | {:>8}",
+        "Timestamp", "DateTime", "Mid Price", "Inventory", "PnL", "Bid", "Ask", "BidFill", "AskFill");
+    println!("{:-<145}", "");
     
     let mut last_bid = Decimal::ZERO;
     let mut last_ask = Decimal::ZERO;
@@ -290,7 +302,7 @@ fn main() -> std::io::Result<()> {
                 output_file,
                 "{},{},{},{},{},{},{:.2},{},{},{},{},{:.6},{:.2}",
                 current_ts,
-                "N/A",
+                format_timestamp(current_ts),
                 mid_price,
                 inventory_display,
                 state.cash,
@@ -306,8 +318,8 @@ fn main() -> std::io::Result<()> {
             
             if row_count % 10 == 0 {
                 println!(
-                    "{:<15} | {:>12.2} | {:>10} | {:>10.2} | {:>12.2} | {:>12.2} | {:>8} | {:>8}",
-                    current_ts, mid_price, inventory_display, pnl, optimal.bid_price, optimal.ask_price, state.bid_fills, state.ask_fills
+                    "{:<15} | {:<24} | {:>12.2} | {:>10} | {:>10.2} | {:>12.2} | {:>12.2} | {:>8} | {:>8}",
+                    current_ts, format_timestamp(current_ts), mid_price, inventory_display, pnl, optimal.bid_price, optimal.ask_price, state.bid_fills, state.ask_fills
                 );
             }
             row_count += 1;
