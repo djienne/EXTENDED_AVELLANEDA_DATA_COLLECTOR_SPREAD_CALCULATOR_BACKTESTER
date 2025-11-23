@@ -38,7 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loader = DataLoader::new(
         Path::new("data/ETH_USD/trades.csv"),
         Path::new("data/ETH_USD/orderbook_depth.csv"),
-    )?;
+    );
     println!("Loaded {} trades and {} orderbooks", loader.get_trades().len(), loader.orderbooks_iter().count());
 
     // 3. Initialize Calibration Engine
