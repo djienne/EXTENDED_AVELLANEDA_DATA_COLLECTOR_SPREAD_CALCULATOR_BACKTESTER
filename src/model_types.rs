@@ -33,6 +33,24 @@ pub struct ASConfig {
     pub min_volatility: f64,
     pub max_volatility: f64,
     pub fill_cooldown_seconds: u64,
+    #[serde(default = "default_quote_validity")]
+    pub quote_validity_seconds: u64,
+    #[serde(default = "default_gap_threshold")]
+    pub gap_threshold_seconds: u64,
+    #[serde(default = "default_warmup_period")]
+    pub warmup_period_seconds: u64,
+}
+
+fn default_gap_threshold() -> u64 {
+    1800 // 30 minutes
+}
+
+fn default_warmup_period() -> u64 {
+    900 // 15 minutes
+}
+
+pub fn default_quote_validity() -> u64 {
+    60
 }
 
 impl Default for ASConfig {
@@ -57,6 +75,9 @@ impl Default for ASConfig {
             min_volatility: 0.0,
             max_volatility: 0.02,
             fill_cooldown_seconds: 0,
+            quote_validity_seconds: 60,
+            gap_threshold_seconds: 1800,
+            warmup_period_seconds: 900,
         }
     }
 }
