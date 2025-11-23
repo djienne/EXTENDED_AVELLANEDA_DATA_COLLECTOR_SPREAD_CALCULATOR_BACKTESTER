@@ -46,3 +46,23 @@ tokio-test = "0.4"
 [[bin]]
 name = "collect_data"
 path = "src/bin/collect_data.rs"
+
+# Backtest binary
+[[bin]]
+name = "backtest"
+path = "src/bin/backtest.rs"
+
+# Grid search binary
+[[bin]]
+name = "grid_search"
+path = "src/bin/grid_search.rs"
+
+# Verification binary
+[[bin]]
+name = "verify_orderbook"
+path = "src/bin/verify_orderbook.rs"
+
+# Spread calculation binary
+[[bin]]
+name = "calculate_spread"
+path = "src/bin/calculate_spread.rs"

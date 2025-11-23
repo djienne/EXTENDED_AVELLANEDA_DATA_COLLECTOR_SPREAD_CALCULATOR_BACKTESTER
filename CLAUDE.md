@@ -1,98 +1,145 @@
 # CLAUDE.md
 
-Data collector for Extended DEX (Starknet perpetuals). Collects orderbook depth and public trades via WebSocket and saves to CSV files.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Extended DEX data collector and market-making backtester. Collects high-frequency orderbook/trade data via WebSocket and backtests Avellaneda-Stoikov (AS) market-making strategies.
 
 ## Quick Commands
 
 ```bash
+# Build
 cargo build --release
+
+# Data collection
 cargo run --bin collect_data
 RUST_LOG=debug cargo run --bin collect_data
+
+# Backtesting (requires collected data)
+cargo run --bin backtest
+
+# Spread calculation
+cargo run --bin calculate_spread
+
+# Verify orderbook integrity
+cargo run --bin verify_orderbook
 ```
 
-## Core Files
+## Architecture Overview
 
-- `src/bin/collect_data.rs` - Main data collection binary
-- `src/websocket.rs` - WebSocket streaming client
-- `src/data_collector.rs` - CSV writers for orderbook and trades
-- `src/data_collection_task.rs` - Data collection task logic
-- `src/rest.rs` - REST API client
-- `src/types.rs` - Data types
+**Three-Phase System**:
+1. **Data Collection** (`collect_data`) - Stream and persist market data
+2. **Calibration** (`calibration.rs`) - Calculate volatility (σ) and intensity parameters (κ, A) from historical data
+3. **Backtesting** (`backtest`) - Simulate AS market-making strategy with realistic constraints
 
-## Features
+**Key Modules**:
+- `websocket.rs` - WebSocket client for streaming orderbooks and trades
+- `data_collector.rs` - CSV writers with deduplication and state persistence
+- `data_loader.rs` - Load historical CSV data for backtesting
+- `calibration.rs` - Volatility (σ) and intensity (κ, A) parameter estimation
+- `spread_model.rs` - AS optimal quote calculation with inventory skew
+- `model_types.rs` - Configuration types for AS model (ASConfig, GammaMode, etc.)
+- `metrics.rs` - Performance tracking (PnL, Sharpe, fills, etc.)
 
-**WebSocket Data Collection**:
-- Orderbook depth (configurable levels, default 20)
-- Public trades
-- Automatic deduplication
-- State persistence for resume capability
-- Handles SNAPSHOT and DELTA updates
+## Core Binaries
 
-**CSV Format**:
+- `src/bin/collect_data.rs` - Data collection service (WebSocket → CSV)
+- `src/bin/backtest.rs` - Event-driven AS backtester with fill simulation
+- `src/bin/calculate_spread.rs` - Optimal spread calculator
+- `src/bin/verify_orderbook.rs` - Orderbook data integrity checker
+
+## Data Collection
+
+**WebSocket Streaming**:
+- Subscribes to orderbook depth (SNAPSHOT + DELTA updates) and public trades
+- Maintains full orderbook state by merging deltas
+- Deduplicates trades by ID, orderbook updates by sequence number
+- Saves state every 30s and on Ctrl+C for resume capability
+
+**CSV Output Format**:
 - `orderbook_depth.csv`: Horizontal format, one row per snapshot, N levels as columns
   - Headers: `timestamp_ms,datetime,market,seq,bid_price0,bid_qty0,ask_price0,ask_qty0,...`
 - `trades.csv`: One row per trade
   - Headers: `timestamp_ms,datetime,market,side,price,quantity,trade_id,trade_type`
-- Buffered writing (8KB), flush every 5 seconds
-- Time-sorted with deduplication
+- `state.json`: Resume state (last trade ID, orderbook seq, timestamps)
 
-**WebSocket Depth**:
-- Initial SNAPSHOT (full orderbook state)
-- Subsequent UPDATE/DELTA (partial changes)
-- Maintains full orderbook state and merges deltas
+**Data Storage**:
+```
+data/{market}/
+  orderbook_depth.csv    # Full depth (20 levels default)
+  trades.csv             # Public trades
+  state.json             # Resume state
+```
+
+## Avellaneda-Stoikov Model
+
+**AS Quote Calculation** (`spread_model.rs:compute_optimal_quote`):
+- Computes optimal bid/ask spreads based on inventory risk and market volatility
+- Formula: `spread = γσ²T + (2/γ)ln(1 + γ/κ)`
+  - `γ` (gamma): Risk aversion parameter (constant, inventory-scaled, or max-shift mode)
+  - `σ` (sigma): Volatility (calculated from price returns)
+  - `κ` (kappa): Fill intensity parameter (fitted from trade arrival rates)
+  - `T`: Time horizon (inventory_horizon_seconds)
+- Inventory skew: `reservation_price = mid - γσ²T·q` (q = current inventory)
+- Enforces minimum spread (2× maker fee), maximum spread, and tick size rounding
+
+**Gamma Modes** (`model_types.rs:GammaMode`):
+- `Constant`: Fixed risk aversion
+- `InventoryScaled`: Scales with inventory ratio (0 at center, max at limits)
+- `MaxShift`: Derived from max_shift_ticks to cap price skew
+
+**Parameter Calibration** (`calibration.rs`):
+- `calculate_volatility`: Computes σ from log returns over rolling window
+- `fit_intensity_parameters`: Fits A and κ using exponential regression on trade arrival rates vs. price deltas
+
+## Backtesting
+
+**Event-Driven Engine** (`src/bin/backtest.rs`):
+- Processes orderbooks chronologically, simulates fills between orderbook updates
+- Enforces inventory limits, transaction costs (maker/taker fees), cash balance
+- Supports fill cooldowns (separate bid/ask to allow two-way flow)
+- Handles data gaps: warm-up period after gaps > gap_threshold_seconds
+- Dynamic recalibration: Updates σ, κ, A every recalibration_interval_seconds
+
+**Fill Logic**:
+- Quote valid for quote_validity_seconds after orderbook update
+- Fill occurs if market crosses posted quote before next orderbook update
+- Uses mid-point of crossing candle for fill price (conservative estimate)
+- Respects fill_cooldown_seconds per side (last_bid_fill_ts, last_ask_fill_ts)
+
+**Output**: `data/{market}/backtest_results.csv` and `as_results.csv` with detailed metrics
 
 ## Configuration (config.json)
 
-```json
-{
-  "markets": ["BTC-USD", "ETH-USD", "SOL-USD"],
-  "data_directory": "data",
-  "collect_orderbook": true,
-  "collect_trades": true,
-  "collect_full_orderbook": true,
-  "max_depth_levels": 20
-}
-```
+**Data Collection**:
+- `markets`: List of markets (e.g., ["ETH-USD", "BTC-USD"])
+- `data_directory`: Output directory (default: "data")
+- `collect_orderbook`, `collect_trades`, `collect_full_orderbook`: Enable/disable streams
+- `max_depth_levels`: Orderbook depth (default: 20)
 
-**Key Settings**:
-- `markets`: List of markets to collect data for
-- `data_directory`: Where to save CSV files (default: `data/`)
-- `collect_orderbook`: Collect best bid/ask (default: `true`)
-- `collect_trades`: Collect public trades (default: `true`)
-- `collect_full_orderbook`: Collect full orderbook depth (default: `true`)
-- `max_depth_levels`: Number of orderbook levels to collect (default: 20)
+**AS Backtesting**:
+- `inventory_horizon_seconds`: Time horizon T (default: 1800)
+- `risk_aversion_gamma`: Risk aversion γ (default: 0.1)
+- `fill_cooldown_seconds`: Min time between fills on same side (default: 60)
+- `maker_fee_bps`, `taker_fee_bps`: Transaction costs (default: 1.5, 4.5)
+- `gap_threshold_seconds`: Max gap before warm-up (default: 1800)
+- `warmup_period_seconds`: Warm-up duration after gap (default: 900)
+- `quote_validity_seconds`: Quote expiration time (default: 60)
+- `calibration_window_seconds`: Window for σ/κ calculation (default: 3600)
+- `recalibration_interval_seconds`: How often to recalibrate (default: 600)
 
-## Data Storage
+**Advanced**:
+- `gamma_mode`: "constant", "inventory_scaled", or "max_shift"
+- `max_shift_ticks`: Max price skew from mid (used in max_shift mode)
+- `min_spread_bps`, `max_spread_bps`: Spread bounds
+- `min_volatility`, `max_volatility`: Volatility clamps
 
-Data is saved to:
-```
-data/
-  {market}/
-    orderbook_depth.csv    # Full depth (N levels)
-    orderbook.csv          # Best bid/ask only
-    trades.csv             # Public trades
-    state.json             # Resume state
-```
+## Important Workflow Notes
 
-## Resume Capability
-
-The collector saves state to `state.json` every 30 seconds and on shutdown (Ctrl+C). When restarted, it:
-- Skips already-collected trades (by trade ID)
-- Skips already-seen orderbook updates (by sequence number)
-- Maintains time-sorted order
-- Continues from last position
+1. **Collect data FIRST**: Backtesting requires historical data. Run `collect_data` for several hours minimum before backtesting.
+2. **Warm-up periods**: Backtest skips the first `warmup_period_seconds` and after gaps > `gap_threshold_seconds` to ensure calibration convergence.
+3. **No look-ahead bias**: Fill simulation uses only information available before the fill (orderbook seq, trade timestamps).
+4. **Resume capability**: Data collection can be stopped/started - it resumes from last state.
 
 ## No API Key Required
 
-Public data collection doesn't require authentication. For authenticated WebSocket subscriptions (account updates), set:
-
-```bash
-# .env (optional, only for authenticated endpoints)
-API_KEY=...
-```
-
-## Examples
-
-- `examples/collect_data.rs` - Basic data collection example
-- `examples/public_trades.rs` - Public trades subscription
-- `examples/ws_latency_test.rs` - WebSocket latency testing
+Public data collection works without authentication. For authenticated WebSocket (account updates), set `API_KEY` in `.env`.

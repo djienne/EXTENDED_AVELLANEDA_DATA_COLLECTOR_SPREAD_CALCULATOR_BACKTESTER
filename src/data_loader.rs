@@ -1,12 +1,34 @@
 use crate::model_types::TradeEvent;
-use csv::ReaderBuilder;
+use csv::{ReaderBuilder, StringRecord};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 use serde::Deserialize;
 use std::error::Error;
 use std::fs::File;
-use std::path::Path;
-use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::iter::Peekable;
+
+#[derive(Debug, Clone)]
+pub enum DataEvent {
+    Trade(TradeEvent),
+    Orderbook(OrderbookSnapshot),
+}
+
+impl DataEvent {
+    pub fn timestamp(&self) -> u64 {
+        match self {
+            DataEvent::Trade(t) => t.timestamp,
+            DataEvent::Orderbook(o) => o.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderbookSnapshot {
+    pub timestamp: u64,
+    pub bids: Vec<(Decimal, Decimal)>, // (price, qty)
+    pub asks: Vec<(Decimal, Decimal)>, // (price, qty)
+}
 
 #[derive(Debug, Deserialize)]
 struct RawTrade {
@@ -17,118 +39,155 @@ struct RawTrade {
 }
 
 pub struct DataLoader {
-    pub trades: Vec<TradeEvent>,
-    pub orderbooks: BTreeMap<u64, OrderbookSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OrderbookSnapshot {
-    pub timestamp: u64,
-    pub bids: Vec<(Decimal, Decimal)>, // (price, qty)
-    pub asks: Vec<(Decimal, Decimal)>, // (price, qty)
+    trades_path: PathBuf,
+    orderbook_path: PathBuf,
 }
 
 impl DataLoader {
-    pub fn new(trades_path: &Path, orderbook_path: &Path) -> Result<Self, Box<dyn Error>> {
-        let trades = Self::load_trades(trades_path)?;
-        let orderbooks = Self::load_orderbooks(orderbook_path)?;
-        
-        Ok(Self { trades, orderbooks })
-    }
-
-    fn load_trades(path: &Path) -> Result<Vec<TradeEvent>, Box<dyn Error>> {
-        let file = File::open(path)?;
-        let mut rdr = ReaderBuilder::new().from_reader(file);
-        let mut trades = Vec::new();
-
-        for result in rdr.deserialize() {
-            let raw: RawTrade = result?;
-            let price = Decimal::from_str(&raw.price)?;
-            let quantity = Decimal::from_str(&raw.quantity)?;
-            
-            // If side is "sell", the aggressor is selling, so the maker is the buyer.
-            // is_buyer_maker = true means the maker was the buyer (aggressor sold into bid).
-            let is_buyer_maker = raw.side.to_lowercase() == "sell";
-
-            trades.push(TradeEvent {
-                timestamp: raw.timestamp_ms,
-                price,
-                quantity,
-                is_buyer_maker,
-            });
+    pub fn new(trades_path: &Path, orderbook_path: &Path) -> Self {
+        Self {
+            trades_path: trades_path.to_path_buf(),
+            orderbook_path: orderbook_path.to_path_buf(),
         }
-        
-        // Sort by timestamp just in case
-        trades.sort_by_key(|t| t.timestamp);
-        
-        Ok(trades)
     }
 
-    fn load_orderbooks(path: &Path) -> Result<BTreeMap<u64, OrderbookSnapshot>, Box<dyn Error>> {
-        let file = File::open(path)?;
-        let mut rdr = ReaderBuilder::new().from_reader(file);
-        let mut orderbooks = BTreeMap::new();
+    pub fn stream(&self) -> Result<MergedDataIterator, Box<dyn Error>> {
+        let trades_file = File::open(&self.trades_path)?;
+        // Use a large buffer (1MB) to read chunks from disk, improving performance
+        let trades_buf = std::io::BufReader::with_capacity(1024 * 1024, trades_file);
+        let trades_rdr = ReaderBuilder::new().from_reader(trades_buf);
+        let trades_iter = trades_rdr.into_deserialize::<RawTrade>();
+
+        let orderbook_file = File::open(&self.orderbook_path)?;
+        let orderbook_buf = std::io::BufReader::with_capacity(1024 * 1024, orderbook_file);
+        let mut orderbook_rdr = ReaderBuilder::new().from_reader(orderbook_buf);
         
         // Get headers to determine depth
-        let headers = rdr.headers()?.clone();
+        let headers = orderbook_rdr.headers()?.clone();
         let mut max_levels = 0;
         for field in headers.iter() {
             if field.starts_with("bid_price") {
                 max_levels += 1;
             }
         }
+        
+        let orderbook_iter = orderbook_rdr.into_records();
 
-        for result in rdr.records() {
-            let record = result?;
-            let timestamp: u64 = record[0].parse()?;
-            
-            let mut bids = Vec::new();
-            let mut asks = Vec::new();
+        Ok(MergedDataIterator {
+            trades_iter: trades_iter.peekable(),
+            orderbook_iter: orderbook_iter.peekable(),
+            max_levels,
+            next_trade: None,
+            next_orderbook: None,
+        })
+    }
+}
 
-            // Columns: timestamp,datetime,market,seq (0-3)
-            // Then bid_price0, bid_qty0, ask_price0, ask_qty0 (4, 5, 6, 7)
-            // Then bid_price1, ...
-            
-            for i in 0..max_levels {
-                let base_idx = 4 + (i * 4);
-                if base_idx + 3 >= record.len() {
-                    break;
-                }
+pub struct MergedDataIterator {
+    trades_iter: Peekable<csv::DeserializeRecordsIntoIter<std::io::BufReader<File>, RawTrade>>,
+    orderbook_iter: Peekable<csv::StringRecordsIntoIter<std::io::BufReader<File>>>,
+    max_levels: usize,
+    // Buffers to hold the parsed next event to allow peeking/comparison
+    next_trade: Option<TradeEvent>,
+    next_orderbook: Option<OrderbookSnapshot>,
+}
 
-                let bid_price = Decimal::from_str(&record[base_idx])?;
-                let bid_qty = Decimal::from_str(&record[base_idx + 1])?;
-                let ask_price = Decimal::from_str(&record[base_idx + 2])?;
-                let ask_qty = Decimal::from_str(&record[base_idx + 3])?;
+impl Iterator for MergedDataIterator {
+    type Item = Result<DataEvent, Box<dyn Error>>;
 
-                if bid_price > Decimal::ZERO {
-                    bids.push((bid_price, bid_qty));
-                }
-                if ask_price > Decimal::ZERO {
-                    asks.push((ask_price, ask_qty));
-                }
+    fn next(&mut self) -> Option<Self::Item> {
+        // Ensure we have the next trade buffered if available
+        if self.next_trade.is_none() {
+            match self.trades_iter.next() {
+                Some(Ok(raw)) => {
+                    match parse_trade(raw) {
+                        Ok(trade) => self.next_trade = Some(trade),
+                        Err(e) => return Some(Err(e)),
+                    }
+                },
+                Some(Err(e)) => return Some(Err(Box::new(e))),
+                None => {} // End of trades
             }
-
-            orderbooks.insert(timestamp, OrderbookSnapshot {
-                timestamp,
-                bids,
-                asks,
-            });
         }
 
-        Ok(orderbooks)
+        // Ensure we have the next orderbook buffered if available
+        if self.next_orderbook.is_none() {
+            match self.orderbook_iter.next() {
+                Some(Ok(record)) => {
+                    match parse_orderbook(record, self.max_levels) {
+                        Ok(ob) => self.next_orderbook = Some(ob),
+                        Err(e) => return Some(Err(e)),
+                    }
+                },
+                Some(Err(e)) => return Some(Err(Box::new(e))),
+                None => {} // End of orderbooks
+            }
+        }
+
+        // Compare timestamps and yield the smaller one
+        match (&self.next_trade, &self.next_orderbook) {
+            (Some(t), Some(ob)) => {
+                if t.timestamp <= ob.timestamp {
+                    let trade = self.next_trade.take().unwrap();
+                    Some(Ok(DataEvent::Trade(trade)))
+                } else {
+                    let ob = self.next_orderbook.take().unwrap();
+                    Some(Ok(DataEvent::Orderbook(ob)))
+                }
+            },
+            (Some(_), None) => {
+                let trade = self.next_trade.take().unwrap();
+                Some(Ok(DataEvent::Trade(trade)))
+            },
+            (None, Some(_)) => {
+                let ob = self.next_orderbook.take().unwrap();
+                Some(Ok(DataEvent::Orderbook(ob)))
+            },
+            (None, None) => None,
+        }
+    }
+}
+
+fn parse_trade(raw: RawTrade) -> Result<TradeEvent, Box<dyn Error>> {
+    let price = Decimal::from_str(&raw.price)?;
+    let quantity = Decimal::from_str(&raw.quantity)?;
+    let is_buyer_maker = raw.side.to_lowercase() == "sell";
+
+    Ok(TradeEvent {
+        timestamp: raw.timestamp_ms,
+        price,
+        quantity,
+        is_buyer_maker,
+    })
+}
+
+fn parse_orderbook(record: StringRecord, max_levels: usize) -> Result<OrderbookSnapshot, Box<dyn Error>> {
+    let timestamp: u64 = record[0].parse()?;
+    let mut bids = Vec::new();
+    let mut asks = Vec::new();
+
+    for i in 0..max_levels {
+        let base_idx = 4 + (i * 4);
+        if base_idx + 3 >= record.len() {
+            break;
+        }
+
+        let bid_price = Decimal::from_str(&record[base_idx])?;
+        let bid_qty = Decimal::from_str(&record[base_idx + 1])?;
+        let ask_price = Decimal::from_str(&record[base_idx + 2])?;
+        let ask_qty = Decimal::from_str(&record[base_idx + 3])?;
+
+        if bid_price > Decimal::ZERO {
+            bids.push((bid_price, bid_qty));
+        }
+        if ask_price > Decimal::ZERO {
+            asks.push((ask_price, ask_qty));
+        }
     }
 
-    pub fn get_trades(&self) -> &Vec<TradeEvent> {
-        &self.trades
-    }
-
-    /// Get the orderbook snapshot closest to (but not after) the given timestamp
-    pub fn get_closest_orderbook(&self, timestamp: u64) -> Option<&OrderbookSnapshot> {
-        self.orderbooks.range(..=timestamp).next_back().map(|(_, v)| v)
-    }
-    
-    /// Get iterator over orderbooks
-    pub fn orderbooks_iter(&self) -> std::collections::btree_map::Iter<u64, OrderbookSnapshot> {
-        self.orderbooks.iter()
-    }
+    Ok(OrderbookSnapshot {
+        timestamp,
+        bids,
+        asks,
+    })
 }

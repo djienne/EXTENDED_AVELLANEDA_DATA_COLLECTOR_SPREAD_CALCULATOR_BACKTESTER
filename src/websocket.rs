@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// WebSocket client for Extended exchange
+#[derive(Clone)]
 pub struct WebSocketClient {
     base_url: String,
     api_key: Option<String>,
