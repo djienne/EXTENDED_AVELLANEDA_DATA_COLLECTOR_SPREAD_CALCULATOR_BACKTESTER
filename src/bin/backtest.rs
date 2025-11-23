@@ -129,28 +129,63 @@ fn main() -> std::io::Result<()> {
     let mut trade_idx = 0;
     let mut active_bid_price: Option<Decimal> = None;
     let mut active_ask_price: Option<Decimal> = None;
+    let mut active_quote_ts: u64 = 0;
+    let mut last_orderbook_ts: u64 = 0;
+    let mut warmup_end_ts: u64 = 0;
     
     // Constants for simulation
     let max_inventory_decimal = Decimal::from_f64(config.max_inventory).unwrap_or(Decimal::from(10));
     let fee_bps = Decimal::from_f64(config.maker_fee_bps).unwrap_or(Decimal::from(1));
     let fee_multiplier = fee_bps / Decimal::from(10000);
+    let quote_validity_ms = config.quote_validity_seconds * 1000;
+    let gap_threshold_ms = config.gap_threshold_seconds * 1000;
+    let warmup_period_ms = config.warmup_period_seconds * 1000;
 
     for (idx, quote) in orderbooks.iter().enumerate() {
         let current_ts = quote.timestamp;
         
+        // Check for data gaps
+        if last_orderbook_ts > 0 {
+            let time_delta = current_ts.saturating_sub(last_orderbook_ts);
+            if time_delta > gap_threshold_ms {
+                warmup_end_ts = current_ts + warmup_period_ms;
+                println!("Gap detected ({}s). Entering warm-up until {}", 
+                    time_delta / 1000, 
+                    format_timestamp(warmup_end_ts));
+                
+                // Invalidate quotes during gap/warmup
+                active_bid_price = None;
+                active_ask_price = None;
+                active_quote_ts = 0;
+            }
+        }
+        last_orderbook_ts = current_ts;
+        
+        // Check if we are in warm-up period
+        let is_warming_up = current_ts < warmup_end_ts;
+
         // 1. Process trades that happened since the last orderbook update
         // These trades execute against the quotes we set in the PREVIOUS iteration
         while trade_idx < trades.len() && trades[trade_idx].timestamp < current_ts {
             let trade = &trades[trade_idx];
             
+            // Skip trading if warming up
+            if is_warming_up {
+                trade_idx += 1;
+                continue;
+            }
+            
             // Check cooldown
             let cooldown_ms = config.fill_cooldown_seconds * 1000;
-            // Global cooldown check removed - now side specific
             
-            // Only check for fills if we have active quotes
+            // Check quote validity
+            let is_quote_valid = active_quote_ts > 0 && trade.timestamp < active_quote_ts + quote_validity_ms;
+            
+            // Only check for fills if we have active quotes AND they are valid
             if let (Some(bid), Some(ask)) = (active_bid_price, active_ask_price) {
-                // SELL FILL: Market trade price >= our ask (someone bought from us)
-                if trade.price >= ask {
+                if is_quote_valid {
+                    // SELL FILL: Market trade price >= our ask (someone bought from us)
+                    if trade.price >= ask {
                      // Check cooldown for ASK side
                      if state.last_ask_fill_ts > 0 && trade.timestamp < state.last_ask_fill_ts + cooldown_ms {
                          // Cooldown active, skip this fill
@@ -208,6 +243,7 @@ fn main() -> std::io::Result<()> {
                             }
                         }
                     }
+                }
                 }
             }
             
@@ -284,6 +320,7 @@ fn main() -> std::io::Result<()> {
             // Set active quotes for the NEXT interval
             active_bid_price = Some(optimal.bid_price);
             active_ask_price = Some(optimal.ask_price);
+            active_quote_ts = current_ts;
             optimal_spread = optimal.optimal_spread;
             optimal_gamma = optimal.gamma;
             
