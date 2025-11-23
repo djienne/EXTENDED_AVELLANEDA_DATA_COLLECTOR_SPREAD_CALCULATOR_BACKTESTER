@@ -2,7 +2,7 @@ use crate::error::{ConnectorError, Result};
 use crate::types::{
     AccountInfo, ApiResponse, Balance, BidAsk, FeeInfo, FundingRateData, FundingRateInfo, MarketConfig,
     MarketInfo, OrderBook, OrderSide, PaginatedResponse,
-    Position, Trade, TradeType,
+    Position, PublicTrade, Trade, TradeType,
 };
 use reqwest::Client;
 use std::time::Duration;
@@ -81,6 +81,50 @@ impl RestClient {
                     orderbook.ask.len()
                 );
                 Ok(orderbook)
+            }
+            None => {
+                let error_msg = api_response
+                    .error
+                    .map(|e| format!("{}: {}", e.code, e.message))
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                error!("API error response: {}", error_msg);
+                Err(ConnectorError::ApiError(error_msg))
+            }
+        }
+    }
+
+    /// Get public trades for a specific market
+    pub async fn get_public_trades(&self, market: &str) -> Result<Vec<PublicTrade>> {
+        let url = format!("{}/info/markets/{}/trades", self.base_url, market);
+        debug!("Fetching public trades for {} from {}", market, url);
+
+        let mut request = self.client.get(&url);
+
+        if let Some(api_key) = &self.api_key {
+            request = request.header("X-Api-Key", api_key);
+        }
+
+        let response = request.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            error!("API error: {} - {}", status, error_text);
+            return Err(ConnectorError::ApiError(format!(
+                "HTTP {}: {}",
+                status, error_text
+            )));
+        }
+
+        let api_response: ApiResponse<Vec<PublicTrade>> = response.json().await?;
+
+        match api_response.data {
+            Some(trades) => {
+                info!("Fetched {} public trades for {}", trades.len(), market);
+                Ok(trades)
             }
             None => {
                 let error_msg = api_response

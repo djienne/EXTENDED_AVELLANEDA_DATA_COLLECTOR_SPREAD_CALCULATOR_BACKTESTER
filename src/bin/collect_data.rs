@@ -18,14 +18,16 @@
 /// The service can be interrupted and restarted - it will resume from where
 /// it left off and avoid duplicates.
 use extended_data_collector::{
-    init_logging, FullOrderbookCsvWriter, TradesCsvWriter, WebSocketClient,
+    init_logging, rest::RestClient, FullOrderbookCsvWriter, TradesCsvWriter, WebSocketClient,
 };
 use serde::Deserialize;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::signal;
 use tokio::time::{interval, Duration};
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -61,6 +63,7 @@ impl Config {
 /// Collector for a single market
 struct MarketCollector {
     market: String,
+    data_dir: PathBuf,
     trades_writer: Option<Arc<TradesCsvWriter>>,
     orderbook_writer: Option<Arc<FullOrderbookCsvWriter>>,
 }
@@ -87,6 +90,7 @@ impl MarketCollector {
 
         Ok(Self {
             market,
+            data_dir: data_dir.to_path_buf(),
             trades_writer,
             orderbook_writer,
         })
@@ -97,10 +101,85 @@ impl MarketCollector {
             println!("📊 Starting trades collection for {}", self.market);
             let writer: Arc<TradesCsvWriter> = Arc::clone(writer);
             let market = self.market.clone();
+            let data_dir = self.data_dir.clone();
             let ws_client = ws_client.clone();
 
             tokio::spawn(async move {
+                // Initialize REST client for backfilling
+                let rest_client = match RestClient::new_mainnet(None) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        eprintln!("⚠️ Failed to initialize REST client for backfilling: {}", e);
+                        None
+                    }
+                };
+
                 loop {
+                    // Try to backfill missing trades before connecting
+                    if let Some(client) = &rest_client {
+                        let (_, last_id, last_ts_opt) = writer.get_stats().await;
+
+                        // Gap Detection
+                        if let Some(last_ts) = last_ts_opt {
+                             let now = Utc::now().timestamp_millis() as u64;
+                             if now > last_ts + 5000 {
+                                 let duration = now - last_ts;
+                                 eprintln!("⚠️ Detected gap of {} ms for {}. Logging to gaps.csv...", duration, market);
+
+                                 let market_dir = data_dir.join(market.replace("-", "_").to_lowercase());
+                                 let gap_file = market_dir.join("gaps.csv");
+
+                                 let header = !gap_file.exists();
+                                 if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&gap_file) {
+                                     if header {
+                                         let _ = writeln!(file, "start_ts,end_ts,duration_ms,start_fmt,end_fmt");
+                                     }
+
+                                     let start_fmt = DateTime::<Utc>::from_timestamp((last_ts / 1000) as i64, ((last_ts % 1000) * 1_000_000) as u32).map(|d| d.to_rfc3339()).unwrap_or_default();
+                                     let end_fmt = DateTime::<Utc>::from_timestamp((now / 1000) as i64, ((now % 1000) * 1_000_000) as u32).map(|d| d.to_rfc3339()).unwrap_or_default();
+
+                                     let _ = writeln!(file, "{},{},{},{},{}", last_ts, now, duration, start_fmt, end_fmt);
+                                 }
+                             }
+                        }
+
+                        if let Some(last_seen_id) = last_id {
+                             println!("🔄 Checking for missing trades via REST for {} (last ID: {})...", market, last_seen_id);
+                             match client.get_public_trades(&market).await {
+                                Ok(trades) => {
+                                    // REST returns newest first (descending), so reverse for processing
+                                    let mut new_trades: Vec<_> = trades.into_iter()
+                                        .filter(|t| t.i > last_seen_id)
+                                        .collect();
+                                    new_trades.sort_by_key(|t| t.i); // Sort ascending by ID
+
+                                    if !new_trades.is_empty() {
+                                        println!("📥 Backfilling {} missing trades for {}...", new_trades.len(), market);
+                                        for trade in new_trades {
+                                            // Convert REST PublicTrade to WS PublicTrade
+                                            let ws_trade = extended_data_collector::types::PublicTrade {
+                                                m: trade.m,
+                                                s: trade.s,
+                                                tt: trade.tt,
+                                                t: trade.t,
+                                                p: trade.p,
+                                                q: trade.q,
+                                                i: trade.i,
+                                            };
+                                            if let Err(e) = writer.write_trade(&ws_trade).await {
+                                                 eprintln!("Error writing backfilled trade: {}", e);
+                                            }
+                                        }
+                                        println!("✅ Backfill complete for {}.", market);
+                                    } else {
+                                        println!("✓ No missing trades found for {}.", market);
+                                    }
+                                }
+                                Err(e) => eprintln!("⚠️ Failed to fetch trades for backfill: {}", e),
+                             }
+                        }
+                    }
+
                     println!("Connecting to trades stream for {}...", market);
                     match ws_client.subscribe_public_trades(&market).await {
                         Ok(mut rx) => {
