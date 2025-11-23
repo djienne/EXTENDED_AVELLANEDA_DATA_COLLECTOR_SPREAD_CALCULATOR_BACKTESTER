@@ -18,7 +18,7 @@
 /// The service can be interrupted and restarted - it will resume from where
 /// it left off and avoid duplicates.
 use extended_data_collector::{
-    init_logging, rest::RestClient, FullOrderbookCsvWriter, TradesCsvWriter, WebSocketClient,
+    init_logging, rest::RestClient, OrderbookParquetWriter, TradesCsvWriter, WebSocketClient,
 };
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
@@ -65,7 +65,7 @@ struct MarketCollector {
     market: String,
     data_dir: PathBuf,
     trades_writer: Option<Arc<TradesCsvWriter>>,
-    orderbook_writer: Option<Arc<FullOrderbookCsvWriter>>,
+    orderbook_writer: Option<Arc<OrderbookParquetWriter>>,
 }
 
 impl MarketCollector {
@@ -83,7 +83,7 @@ impl MarketCollector {
 
         let orderbook_writer = if collect_orderbook {
             // Use 20 levels as requested
-            Some(Arc::new(FullOrderbookCsvWriter::new(data_dir, &market, 20)?))
+            Some(Arc::new(OrderbookParquetWriter::new(data_dir, &market, 20)?))
         } else {
             None
         };
@@ -240,7 +240,7 @@ impl MarketCollector {
     async fn collect_full_orderbook(&self, ws_client: &WebSocketClient) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &self.orderbook_writer {
             println!("📈 Starting full orderbook collection for {}", self.market);
-            let writer: Arc<FullOrderbookCsvWriter> = Arc::clone(writer);
+            let writer: Arc<OrderbookParquetWriter> = Arc::clone(writer);
             let market = self.market.clone();
             let ws_client = ws_client.clone();
 

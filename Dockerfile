@@ -1,6 +1,6 @@
 # Multi-stage build for Extended DEX data collector
 # Stage 1: Build the Rust application
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.91-bookworm AS builder
 
 # Set working directory
 WORKDIR /build

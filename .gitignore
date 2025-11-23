@@ -38,6 +38,18 @@ data/*/orderbook.csv
 data/*/orderbook_depth.csv
 data/*/state.json
 
+# OLD backups - exclude entirely
+OLD/
+
+# Parquet files - only track ETH as reference, exclude all others
+data/btc_usd/orderbook_parts/
+data/sol_usd/orderbook_parts/
+# Note: data/eth_usd/orderbook_parts/ is tracked as reference only
+
+# Exclude large CSV and result files
+data/*/as_results.csv
+data/*/backtest_results.csv
+
 # Log files
 *.log
 
