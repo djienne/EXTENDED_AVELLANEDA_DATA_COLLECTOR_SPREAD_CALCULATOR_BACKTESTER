@@ -3,7 +3,8 @@
 //! This module implements continuous data collection from WebSocket streams,
 //! writing orderbook depth and trades to CSV files.
 
-use crate::data_collector::{OrderbookCsvWriter, FullOrderbookCsvWriter, TradesCsvWriter};
+use crate::data_collector::{OrderbookCsvWriter, TradesCsvWriter};
+use crate::storage::OrderbookParquetWriter;
 use crate::websocket::WebSocketClient;
 use crate::error::Result;
 use tokio::sync::{mpsc, Mutex};
@@ -47,7 +48,7 @@ pub async fn run_data_collection_task(
 
     let full_orderbook_writer = if config.collect_full_orderbook {
         Some(Arc::new(Mutex::new(
-            FullOrderbookCsvWriter::new(
+            OrderbookParquetWriter::new(
                 Path::new(&config.data_directory),
                 &config.market,
                 config.max_depth_levels

@@ -11,12 +11,14 @@ pub mod calibration;
 pub mod spread_model;
 pub mod backtest_engine;
 pub mod calibration_engine;
+pub mod storage;
 
 // Re-export commonly used types
 pub use data_collection_task::{run_data_collection_task, DataCollectionConfig};
 pub use data_collector::{CollectorState, OrderbookCsvWriter, FullOrderbookCsvWriter, TradesCsvWriter, OrderbookState};
 pub use error::{ConnectorError, Result};
 pub use rest::RestClient;
+pub use storage::OrderbookParquetWriter;
 pub use types::{
     AccountInfo, AccountUpdate, Balance, BidAsk, FeeInfo, FundingRateInfo, L2Config, MarketConfig, MarketInfo,
     OrderBook, OrderRequest, OrderResponse, OrderSide, OrderStatus, OrderType, Position, PositionSide,

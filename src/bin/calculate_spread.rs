@@ -37,9 +37,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading data...");
     let loader = DataLoader::new(
         Path::new("data/ETH_USD/trades.csv"),
-        Path::new("data/ETH_USD/orderbook_depth.csv"),
+        Path::new("data/ETH_USD/orderbook_parts"),
     );
-    println!("Loaded {} trades and {} orderbooks", loader.get_trades().len(), loader.orderbooks_iter().count());
+    let trades = loader.get_trades()?;
+    let orderbooks_count = loader.orderbooks_iter()?.count();
+    println!("Loaded {} trades and {} orderbooks", trades.len(), orderbooks_count);
 
     // 3. Initialize Calibration Engine
     let mut calibration_engine = CalibrationEngine::new(&config);
@@ -57,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("{:-<155}", "");
 
     // 5. Pre-load all trades for window processing
-    let all_trades = loader.trades.clone();
+    let all_trades = trades;
     let mut trade_idx = 0;
 
     // Track last quote for final output
@@ -65,12 +67,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_ts = 0;
 
     // 6. Process Orderbook Snapshots
-    for (ts, snapshot) in loader.orderbooks_iter() {
-        let current_ts = *ts;
+    for result in loader.orderbooks_iter()? {
+        let (ts, snapshot) = result?;
+        let current_ts = ts;
         last_ts = current_ts;
 
         // Calculate Effective Price
-        let effective_quote = calculate_effective_price(snapshot, config.effective_volume_threshold);
+        let effective_quote = calculate_effective_price(&snapshot, config.effective_volume_threshold);
 
         if let Some(quote) = effective_quote {
             last_quote = Some(quote);
