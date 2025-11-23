@@ -55,8 +55,8 @@ fn main() -> std::io::Result<()> {
     // Load data loader (shared paths)
     println!("Initializing data loader...");
     let loader = DataLoader::new(
-        Path::new("data/ETH_USD/trades.csv"),
-        Path::new("data/ETH_USD/orderbook_depth.csv"),
+        Path::new("data/eth_usd/trades.csv"),
+        Path::new("data/eth_usd/orderbook_parts"),
     );
 
     // Time horizons to test (seconds): 1m, 5m, 15m, 30m, 1h, 2h, 3h, 4h

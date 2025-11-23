@@ -36,8 +36,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load Data
     println!("Loading data...");
     let loader = DataLoader::new(
-        Path::new("data/ETH_USD/trades.csv"),
-        Path::new("data/ETH_USD/orderbook_parts"),
+        Path::new("data/eth_usd/trades.csv"),
+        Path::new("data/eth_usd/orderbook_parts"),
     );
     let trades = loader.get_trades()?;
     let orderbooks_count = loader.orderbooks_iter()?.count();
@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut calibration_engine = CalibrationEngine::new(&config);
 
     // 4. Prepare Output
-    let mut output_file = File::create("data/ETH_USD/as_results.csv")?;
+    let mut output_file = File::create("data/eth_usd/as_results.csv")?;;
     writeln!(output_file, "timestamp,datetime,mid_price,volatility,kappa,A,gamma,optimal_spread_bps,bid_spread_bps,ask_spread_bps,bid_price,ask_price,reservation_price")?;
 
     // Print Header to Terminal
@@ -181,6 +181,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Done! Results written to data/ETH_USD/as_results.csv");
+    println!("Done! Results written to data/eth_usd/as_results.csv");
     Ok(())
 }
