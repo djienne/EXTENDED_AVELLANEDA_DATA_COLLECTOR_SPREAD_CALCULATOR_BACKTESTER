@@ -5,10 +5,10 @@ use std::path::Path;
 fn main() -> Result<(), Box<dyn Error>> {
     println!("Verifying Parquet processing pipeline...");
 
-    // Use data/ETH_USD which has been migrated
+    // Use data/eth_usd which has been migrated
     let loader = DataLoader::new(
-        Path::new("data/ETH_USD/trades.csv"),
-        Path::new("data/ETH_USD/orderbook_parts"),
+        Path::new("data/eth_usd/trades.csv"),
+        Path::new("data/eth_usd/orderbook_parts"),
     );
 
     let mut last_ts = 0;

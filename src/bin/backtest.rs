@@ -31,8 +31,8 @@ fn main() -> std::io::Result<()> {
 
     // Load data using DataLoader
     let loader = DataLoader::new(
-        Path::new("data/ETH_USD/trades.csv"),
-        Path::new("data/ETH_USD/orderbook_depth.csv"),
+        Path::new("data/eth_usd/trades.csv"),
+        Path::new("data/eth_usd/orderbook_parts"),
     );
 
     let data_stream = loader.stream()
@@ -51,7 +51,7 @@ fn main() -> std::io::Result<()> {
         config,
         initial_capital,
         order_notional,
-        output_csv_path: Some("data/ETH_USD/backtest_results.csv".to_string()),
+        output_csv_path: Some("data/eth_usd/backtest_results.csv".to_string()),
         verbose: true,
     };
 
@@ -70,7 +70,7 @@ fn main() -> std::io::Result<()> {
     println!("Total Ask Fills: {}", results.ask_fills);
     println!("Total Fills: {}", results.total_fills());
     println!("Total Volume Traded: {} units", results.total_volume);
-    println!("\nResults written to data/ETH_USD/backtest_results.csv");
+    println!("\nResults written to data/eth_usd/backtest_results.csv");
 
     Ok(())
 }
