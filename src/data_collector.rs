@@ -440,6 +440,24 @@ impl OrderbookCsvWriter {
                     debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
                     return Ok(());
                 }
+            } else if msg.seq > prev_seq + 1 {
+                // CRITICAL: Sequence gap detected (missing messages)
+                // Per Extended DEX docs: "If a client receives a sequence out of order, it should reconnect"
+                warn!(
+                    "❌ SEQUENCE GAP DETECTED: Expected seq {}, got {} (gap of {}). This indicates missing orderbook updates!",
+                    prev_seq + 1, msg.seq, msg.seq - prev_seq - 1
+                );
+                // If it's a SNAPSHOT, we can reset and continue
+                if msg.message_type == "SNAPSHOT" {
+                    warn!("Received SNAPSHOT after gap - accepting as reset");
+                    // Allow it to proceed
+                } else {
+                    // For DELTA messages, we cannot safely continue
+                    // Return error to trigger reconnection at the collect_data level
+                    return Err(crate::error::ConnectorError::ApiError(
+                        format!("Sequence gap detected: expected {}, got {}", prev_seq + 1, msg.seq)
+                    ).into());
+                }
             }
         }
 
@@ -716,6 +734,24 @@ impl FullOrderbookCsvWriter {
                 } else {
                     debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
                     return Ok(());
+                }
+            } else if msg.seq > prev_seq + 1 {
+                // CRITICAL: Sequence gap detected (missing messages)
+                // Per Extended DEX docs: "If a client receives a sequence out of order, it should reconnect"
+                warn!(
+                    "❌ SEQUENCE GAP DETECTED: Expected seq {}, got {} (gap of {}). This indicates missing orderbook updates!",
+                    prev_seq + 1, msg.seq, msg.seq - prev_seq - 1
+                );
+                // If it's a SNAPSHOT, we can reset and continue
+                if msg.message_type == "SNAPSHOT" {
+                    warn!("Received SNAPSHOT after gap - accepting as reset");
+                    // Allow it to proceed
+                } else {
+                    // For DELTA messages, we cannot safely continue
+                    // Return error to trigger reconnection at the collect_data level
+                    return Err(crate::error::ConnectorError::ApiError(
+                        format!("Sequence gap detected: expected {}, got {}", prev_seq + 1, msg.seq)
+                    ).into());
                 }
             }
         }

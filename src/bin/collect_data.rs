@@ -244,6 +244,20 @@ impl MarketCollector {
             let market = self.market.clone();
             let ws_client = ws_client.clone();
 
+            // Spawn periodic flush task (every 30 seconds)
+            let flush_writer = Arc::clone(&writer);
+            let flush_market = market.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await; // First tick completes immediately
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = flush_writer.force_flush().await {
+                        eprintln!("⚠️ Periodic flush error for {}: {}", flush_market, e);
+                    }
+                }
+            });
+
             tokio::spawn(async move {
                 loop {
                     println!("Connecting to full orderbook stream for {}...", market);
@@ -251,21 +265,39 @@ impl MarketCollector {
                         Ok(mut rx) => {
                             println!("✅ Connected to full orderbook stream for {}", market);
                             let mut count = 0;
+                            let mut should_reconnect = false;
                             while let Some(msg) = rx.recv().await {
-                                if let Err(e) = writer.write_full_orderbook(&msg).await {
-                                    eprintln!("Error writing orderbook: {}", e);
-                                } else {
-                                    count += 1;
-                                    if count % 100 == 0 {
-                                        let (total, last_seq, last_ts) = writer.get_stats().await;
-                                        println!(
-                                            "✓ {} orderbook: {} total (last seq: {:?}, last TS: {:?})",
-                                            msg.data.m, total, last_seq, last_ts
-                                        );
+                                match writer.write_full_orderbook(&msg).await {
+                                    Ok(_) => {
+                                        count += 1;
+                                        if count % 100 == 0 {
+                                            let (total, last_seq, last_ts) = writer.get_stats().await;
+                                            println!(
+                                                "✓ {} orderbook: {} total (last seq: {:?}, last TS: {:?})",
+                                                msg.data.m, total, last_seq, last_ts
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        let err_msg = e.to_string();
+                                        eprintln!("❌ Error writing orderbook: {}", err_msg);
+
+                                        // Critical errors that require reconnection
+                                        if err_msg.contains("Sequence gap") || err_msg.contains("sequence") {
+                                            eprintln!("⚠️ CRITICAL: Sequence error detected - forcing reconnection to get fresh SNAPSHOT");
+                                            should_reconnect = true;
+                                            break; // Exit inner loop to reconnect
+                                        }
+                                        // Other errors: log but continue
                                     }
                                 }
                             }
-                            eprintln!("⚠️ Full orderbook stream for {} ended unexpectedly. Reconnecting in 5s...", market);
+
+                            if should_reconnect {
+                                eprintln!("🔄 Reconnecting to full orderbook stream for {} due to sequence error...", market);
+                            } else {
+                                eprintln!("⚠️ Full orderbook stream for {} ended unexpectedly. Reconnecting in 5s...", market);
+                            }
                         }
                         Err(e) => {
                             eprintln!("❌ Failed to subscribe to full orderbook for {}: {}. Retrying in 5s...", market, e);

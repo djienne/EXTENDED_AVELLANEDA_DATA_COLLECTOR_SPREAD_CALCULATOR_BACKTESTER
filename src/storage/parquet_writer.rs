@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 const MAX_ROWS_PER_FILE: usize = 25_000; // Close file and start new one at 25K rows
 const FLUSH_BATCH_SIZE: usize = 100; // Write batch every 100 rows
-const FLUSH_INTERVAL_SECS: u64 = 10; // Or write every 10 seconds
+const FLUSH_INTERVAL_SECS: u64 = 30; // Or write every 30 seconds
 
 fn min_quantity_threshold() -> Decimal {
     Decimal::new(1, 9) // 1e-9
@@ -147,6 +147,24 @@ impl OrderbookParquetWriter {
                     } else {
                         debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
                         return Ok(());
+                    }
+                } else if msg.seq > prev_seq + 1 {
+                    // CRITICAL: Sequence gap detected (missing messages)
+                    // Per Extended DEX docs: "If a client receives a sequence out of order, it should reconnect"
+                    warn!(
+                        "❌ SEQUENCE GAP DETECTED: Expected seq {}, got {} (gap of {}). This indicates missing orderbook updates!",
+                        prev_seq + 1, msg.seq, msg.seq - prev_seq - 1
+                    );
+                    // If it's a SNAPSHOT, we can reset and continue
+                    if msg.message_type == "SNAPSHOT" {
+                        warn!("Received SNAPSHOT after gap - resetting orderbook state");
+                        // Clear orderbook state will happen below
+                    } else {
+                        // For DELTA messages, we cannot safely continue
+                        // Return error to trigger reconnection at the collect_data level
+                        return Err(crate::error::ConnectorError::ApiError(
+                            format!("Sequence gap detected: expected {}, got {}", prev_seq + 1, msg.seq)
+                        ).into());
                     }
                 }
             }
@@ -338,13 +356,15 @@ impl OrderbookParquetWriter {
 
         // Write batch to current open file
         let record_batch = self.build_record_batch(&batch, &schema)?;
+        let current_file_path = file_path_lock.clone();
+
         if let Some(writer) = writer_lock.as_mut() {
             writer.write(&record_batch)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
-            
+
             writer.flush()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush writer: {}", e)))?;
-            
+
             *file_rows_lock += batch_size;
 
             debug!(
@@ -354,6 +374,17 @@ impl OrderbookParquetWriter {
                 MAX_ROWS_PER_FILE,
                 (*file_rows_lock as f64 / MAX_ROWS_PER_FILE as f64) * 100.0
             );
+        }
+
+        // CRITICAL: Force sync to disk (fixes Docker volume buffering)
+        // ArrowWriter.flush() only flushes to OS buffer, not to disk
+        // This ensures data is visible in Docker volumes immediately
+        if let Some(path) = current_file_path {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                if let Err(e) = file.sync_data() {
+                    warn!("Failed to sync file to disk: {}", e);
+                }
+            }
         }
 
         // Update last flush time
@@ -480,5 +511,15 @@ impl OrderbookParquetWriter {
     }
     pub async fn close(&self) -> Result<()> {
         self.close_writer().await
+    }
+
+    /// Force flush of current batch (called by periodic background task)
+    pub async fn force_flush(&self) -> Result<()> {
+        let elapsed_secs = self.last_flush.lock().await.elapsed().as_secs();
+        if elapsed_secs >= FLUSH_INTERVAL_SECS {
+            debug!("Periodic flush triggered ({} seconds elapsed)", elapsed_secs);
+            self.flush_current_batch().await?;
+        }
+        Ok(())
     }
 }
