@@ -337,6 +337,17 @@ impl ParquetOrderbookIterator {
                 .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("parquet"))
                 .collect();
             files.sort(); // Sort by filename for time ordering
+
+            // Check if the last file is valid (it might be the active file being written)
+            if let Some(last_file) = files.last() {
+                if let Ok(file) = File::open(last_file) {
+                    if ParquetRecordBatchReaderBuilder::try_new(file).is_err() {
+                        eprintln!("Warning: Skipping incomplete/active parquet file: {:?}", last_file.file_name().unwrap());
+                        files.pop();
+                    }
+                }
+            }
+            
             files
         } else {
             vec![path.to_path_buf()]
