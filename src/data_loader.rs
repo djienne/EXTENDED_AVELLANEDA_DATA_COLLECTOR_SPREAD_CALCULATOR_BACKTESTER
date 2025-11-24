@@ -342,7 +342,7 @@ impl ParquetOrderbookIterator {
             if let Some(last_file) = files.last() {
                 if let Ok(file) = File::open(last_file) {
                     if ParquetRecordBatchReaderBuilder::try_new(file).is_err() {
-                        eprintln!("Warning: Skipping incomplete/active parquet file: {:?}", last_file.file_name().unwrap());
+                        eprintln!("\nWarning: Skipping incomplete/active parquet file: {:?}", last_file.file_name().unwrap());
                         files.pop();
                     }
                 }
