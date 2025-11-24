@@ -38,6 +38,7 @@ url = "2.5"
 dotenv = "0.15"
 chrono = "0.4"
 csv = "1.3"
+rayon = "1.10"
 
 # Parquet storage
 parquet = { version = "53.0", features = ["snap"] }
@@ -75,3 +76,8 @@ path = "src/bin/calculate_spread.rs"
 [[bin]]
 name = "migrate_orderbook_to_parquet"
 path = "src/bin/migrate_orderbook_to_parquet.rs"
+
+# Grid search with gamma (2D)
+[[bin]]
+name = "grid_search_gamma"
+path = "src/bin/grid_search_gamma.rs"
