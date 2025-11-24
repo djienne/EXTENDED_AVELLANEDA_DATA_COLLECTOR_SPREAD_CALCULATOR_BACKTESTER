@@ -9,10 +9,13 @@
   "collect_trades": true,
   "collect_full_orderbook": true,
   "max_depth_levels": 20,
-  "inventory_horizon_seconds": 1800,
+  "inventory_horizon_seconds": 14400,
+  "risk_aversion_gamma": 0.05,
   "fill_cooldown_seconds": 60,
   "maker_fee_bps": 1.5,
   "taker_fee_bps": 4.5,
   "gap_threshold_seconds": 1800,
-  "warmup_period_seconds": 900
+  "warmup_period_seconds": 900,
+  "_comment_num_threads": "Number of parallel threads (used by grid_search_gamma only)",
+  "num_threads": 8
 }

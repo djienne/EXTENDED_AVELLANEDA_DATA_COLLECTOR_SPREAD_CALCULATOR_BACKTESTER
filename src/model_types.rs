@@ -39,6 +39,8 @@ pub struct ASConfig {
     pub gap_threshold_seconds: u64,
     #[serde(default = "default_warmup_period")]
     pub warmup_period_seconds: u64,
+    #[serde(default = "default_num_threads")]
+    pub num_threads: usize,
 }
 
 fn default_gap_threshold() -> u64 {
@@ -51,6 +53,10 @@ fn default_warmup_period() -> u64 {
 
 pub fn default_quote_validity() -> u64 {
     60
+}
+
+fn default_num_threads() -> usize {
+    4 // Default to 4 threads for parallel grid search
 }
 
 impl Default for ASConfig {
@@ -78,6 +84,7 @@ impl Default for ASConfig {
             quote_validity_seconds: 60,
             gap_threshold_seconds: 1800,
             warmup_period_seconds: 900,
+            num_threads: 4,
         }
     }
 }
