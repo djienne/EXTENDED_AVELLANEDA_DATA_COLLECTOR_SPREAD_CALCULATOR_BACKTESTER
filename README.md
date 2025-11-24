@@ -117,6 +117,7 @@ cargo run --release --bin migrate_orderbook_to_parquet -- data/eth_usd
 *   `recalibration_interval_seconds`: Frequency of parameter updates (default: `600`).
 *   `min_spread_bps`: Minimum spread constraint (default: `3.0`).
 *   `max_spread_bps`: Maximum spread constraint (default: `200.0`).
+*   `num_threads`: Number of parallel threads for grid search (default: `4`).
 
 ## Data Storage
 

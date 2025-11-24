@@ -52,7 +52,6 @@ fn main() -> std::io::Result<()> {
     println!("═══════════════════════════════════════════════════════════");
     println!("    AS Market-Making Strategy - Parallel 2D Grid Search");
     println!("        Time Horizon × Risk Aversion (Gamma)");
-    println!("        Running on 4 parallel threads");
     println!("═══════════════════════════════════════════════════════════\n");
 
     // Load configuration (as base config)
@@ -91,6 +90,7 @@ fn main() -> std::io::Result<()> {
     }
 
     let total_runs = configs.len();
+    let num_threads = base_config.num_threads;
 
     println!("Testing {} time horizons × {} gamma values = {} total configurations",
         horizons.len(), gammas.len(), total_runs);
@@ -102,6 +102,7 @@ fn main() -> std::io::Result<()> {
         .map(|g| format!("{:.2}", g))
         .collect::<Vec<_>>()
         .join(", "));
+    println!("Using {} parallel threads", num_threads);
     println!();
 
     // Shared state for results and progress
@@ -109,9 +110,9 @@ fn main() -> std::io::Result<()> {
     let completed_count = Arc::new(Mutex::new(0));
     let start_time = Instant::now();
 
-    // Configure rayon to use 4 threads
+    // Configure rayon to use configured number of threads
     rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
+        .num_threads(num_threads)
         .build_global()
         .unwrap();
 
@@ -297,8 +298,9 @@ fn main() -> std::io::Result<()> {
     }
 
     println!("\n═══════════════════════════════════════════════════════════");
-    println!("\n⚡ Performance: {:.1}x speedup vs sequential execution",
-        total_runs as f64 * (total_elapsed.as_secs_f64() / total_runs as f64) / total_elapsed.as_secs_f64() * 4.0);
+    println!("\n⚡ Performance: ~{:.1}x speedup vs sequential execution (using {} threads)",
+        num_threads as f64 * 0.95, // Account for overhead
+        num_threads);
 
     Ok(())
 }
