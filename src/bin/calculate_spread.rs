@@ -40,8 +40,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::new("data/eth_usd/orderbook_parts"),
     );
     let trades = loader.get_trades()?;
-    let orderbooks_count = loader.orderbooks_iter()?.count();
-    println!("Loaded {} trades and {} orderbooks", trades.len(), orderbooks_count);
+    // let orderbooks_count = loader.orderbooks_iter()?.count(); // Removed to prevent freezing
+    println!("Loaded {} trades", trades.len());
 
     // 3. Initialize Calibration Engine
     let mut calibration_engine = CalibrationEngine::new(&config);

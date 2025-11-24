@@ -386,20 +386,43 @@ impl ParquetOrderbookIterator {
     }
 
     fn advance_file(&mut self) -> Result<bool, Box<dyn Error>> {
-        if self.current_file_idx >= self.files.len() {
-            return Ok(false);
+        loop {
+            if self.current_file_idx >= self.files.len() {
+                return Ok(false);
+            }
+
+            let file_path = &self.files[self.current_file_idx];
+            self.current_file_idx += 1;
+
+            match File::open(file_path) {
+                Ok(file) => {
+                    match ParquetRecordBatchReaderBuilder::try_new(file) {
+                        Ok(builder) => {
+                            match builder.build() {
+                                Ok(reader) => {
+                                    self.current_reader = Some(Box::new(reader));
+                                    self.current_batch = None;
+                                    self.current_row_idx = 0;
+                                    return Ok(true);
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Skipping unreadable parquet file {:?}: {}", file_path, e);
+                    continue;
+                }
+            }
         }
-
-        let file = File::open(&self.files[self.current_file_idx])?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-        let reader = builder.build()?;
-
-        self.current_reader = Some(Box::new(reader));
-        self.current_batch = None;
-        self.current_row_idx = 0;
-        self.current_file_idx += 1;
-
-        Ok(true)
     }
 
     fn read_snapshot_from_batch(&self, batch: &RecordBatch, row_idx: usize) -> Result<OrderbookSnapshot, Box<dyn Error>> {

@@ -478,4 +478,7 @@ impl OrderbookParquetWriter {
 
         None
     }
+    pub async fn close(&self) -> Result<()> {
+        self.close_writer().await
+    }
 }
