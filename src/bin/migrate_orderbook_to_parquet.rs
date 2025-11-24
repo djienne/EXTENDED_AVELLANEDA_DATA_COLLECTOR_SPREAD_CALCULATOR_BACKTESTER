@@ -222,7 +222,7 @@ fn migrate_market(market_dir: &Path) -> Result<(), Box<dyn Error>> {
 
         let file = File::create(&file_path)?;
         let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
+            .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap()))
             .build();
 
         let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))?;

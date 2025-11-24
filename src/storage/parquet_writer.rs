@@ -323,7 +323,7 @@ impl OrderbookParquetWriter {
             // Create new file and writer
             let file = File::create(&file_path)?;
             let props = WriterProperties::builder()
-                .set_compression(Compression::SNAPPY)
+                .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap()))
                 .build();
 
             let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
