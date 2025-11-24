@@ -288,6 +288,17 @@ impl MarketCollector {
         }
         Ok(())
     }
+
+    async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(writer) = &self.trades_writer {
+            writer.save_state().await?;
+        }
+        if let Some(writer) = &self.orderbook_writer {
+            writer.save_state().await?;
+            writer.close_writer().await?;
+        }
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -402,7 +413,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Save final state for all collectors
             for collector in collectors_arc.iter() {
                 println!("💾 Saving final state for {}...", collector.market);
-                if let Err(e) = collector.save_state().await {
+                if let Err(e) = collector.shutdown().await {
                     eprintln!("Error saving final state for {}: {}", collector.market, e);
                 } else {
                     println!("✅ Saved state for {}", collector.market);

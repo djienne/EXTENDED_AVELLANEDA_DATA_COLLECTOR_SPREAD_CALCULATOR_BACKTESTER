@@ -342,6 +342,9 @@ impl OrderbookParquetWriter {
             writer.write(&record_batch)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
             
+            writer.flush()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush writer: {}", e)))?;
+            
             *file_rows_lock += batch_size;
 
             debug!(
@@ -436,14 +439,10 @@ impl OrderbookParquetWriter {
         // Flush current batch
         self.flush_current_batch().await?;
 
-        // Close current writer if open
-        let mut writer_lock = self.current_writer.lock().await;
-        if let Some(writer) = writer_lock.take() {
-            let file_rows = *self.current_file_rows.lock().await;
-            writer.close()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
-            info!("Closed final parquet file with {} rows on shutdown", file_rows);
-        }
+        // Note: We do NOT close the writer here anymore. 
+        // We keep it open to allow appending until 100K rows.
+        // The writer will be closed by close_writer() on shutdown 
+        // or by flush_current_batch() when rotating files.
 
         let state = self.state.lock().await;
         let state_path = self.parts_dir.parent().unwrap().join("state.json");
@@ -452,6 +451,21 @@ impl OrderbookParquetWriter {
             "Saved state for {}: {} full orderbook depth updates",
             state.market, state.orderbook_updates_count
         );
+        Ok(())
+    }
+
+    pub async fn close_writer(&self) -> Result<()> {
+        // Flush any remaining data
+        self.flush_current_batch().await?;
+
+        // Close current writer if open
+        let mut writer_lock = self.current_writer.lock().await;
+        if let Some(writer) = writer_lock.take() {
+            let file_rows = *self.current_file_rows.lock().await;
+            writer.close()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+            info!("Closed final parquet file with {} rows on shutdown", file_rows);
+        }
         Ok(())
     }
 
