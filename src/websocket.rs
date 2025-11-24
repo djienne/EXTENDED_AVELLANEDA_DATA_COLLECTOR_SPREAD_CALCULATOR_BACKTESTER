@@ -2,8 +2,11 @@ use crate::error::{ConnectorError, Result};
 use crate::types::{AccountUpdate, BidAsk, PublicTrade, WsAccountUpdateMessage, WsOrderBookMessage, WsPublicTradesMessage};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
+use tokio::time::{interval, Instant};
 use tokio_tungstenite::{
     connect_async, tungstenite::client::IntoClientRequest, tungstenite::protocol::Message,
     MaybeTlsStream, WebSocketStream,
@@ -11,6 +14,13 @@ use tokio_tungstenite::{
 use tracing::{debug, error, info, warn};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Keepalive configuration
+const PING_INTERVAL_SECS: u64 = 30; // Send ping every 30 seconds
+const INACTIVITY_TIMEOUT_SECS: u64 = 90; // Reconnect if no message for 90 seconds
+
+/// Error handling configuration
+const MAX_CONSECUTIVE_PARSE_ERRORS: usize = 10; // Reconnect if 10 consecutive parse errors
 
 /// WebSocket client for Extended exchange
 #[derive(Clone)]
@@ -184,40 +194,87 @@ impl WebSocketClient {
         mut ws_stream: WsStream,
         tx: mpsc::UnboundedSender<BidAsk>,
     ) -> Result<()> {
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("Received message: {}", text);
+        let last_message_time = Arc::new(Mutex::new(Instant::now()));
+        let last_message_clone = Arc::clone(&last_message_time);
 
-                    match serde_json::from_str::<WsOrderBookMessage>(&text) {
-                        Ok(orderbook_msg) => {
-                            let bid_ask = BidAsk::from(&orderbook_msg);
-                            if tx.send(bid_ask).is_err() {
-                                warn!("Receiver dropped, closing connection");
-                                break;
+        // Ping interval timer
+        let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping_interval.tick().await; // First tick completes immediately
+
+        // Timeout check interval
+        let mut timeout_check = interval(Duration::from_secs(10));
+        timeout_check.tick().await;
+
+        loop {
+            tokio::select! {
+                // Handle incoming messages
+                msg = ws_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received message: {}", text);
+
+                            match serde_json::from_str::<WsOrderBookMessage>(&text) {
+                                Ok(orderbook_msg) => {
+                                    let bid_ask = BidAsk::from(&orderbook_msg);
+                                    if tx.send(bid_ask).is_err() {
+                                        warn!("Receiver dropped, closing connection");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to parse message: {} - Error: {}", text, e);
+                                }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to parse message: {} - Error: {}", text, e);
+                        Some(Ok(Message::Ping(data))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received ping, sending pong");
+                            if let Err(e) = ws_stream.send(Message::Pong(data)).await {
+                                error!("Failed to send pong: {}", e);
+                                return Err(ConnectorError::WebSocket(e));
+                            }
                         }
+                        Some(Ok(Message::Pong(_))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received pong");
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            info!("WebSocket closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            return Err(ConnectorError::WebSocket(e));
+                        }
+                        None => {
+                            warn!("WebSocket stream ended");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    debug!("Received ping, sending pong");
-                    ws_stream.send(Message::Pong(data)).await?;
+
+                // Send periodic pings
+                _ = ping_interval.tick() => {
+                    debug!("Sending proactive ping");
+                    if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
+                        error!("Failed to send ping: {}", e);
+                        return Err(ConnectorError::WebSocket(e));
+                    }
                 }
-                Ok(Message::Pong(_)) => {
-                    debug!("Received pong");
+
+                // Check for inactivity timeout
+                _ = timeout_check.tick() => {
+                    let last_msg = *last_message_clone.lock().await;
+                    let elapsed = last_msg.elapsed();
+                    if elapsed > Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
+                        warn!("Inactivity timeout: no messages for {:?}, closing connection", elapsed);
+                        return Err(ConnectorError::ApiError(format!(
+                            "Connection inactive for {:?}", elapsed
+                        )));
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("WebSocket closed by server");
-                    break;
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    return Err(ConnectorError::WebSocket(e));
-                }
-                _ => {}
             }
         }
 
@@ -229,39 +286,99 @@ impl WebSocketClient {
         mut ws_stream: WsStream,
         tx: mpsc::UnboundedSender<WsOrderBookMessage>,
     ) -> Result<()> {
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("Received message: {}", text);
+        let last_message_time = Arc::new(Mutex::new(Instant::now()));
+        let last_message_clone = Arc::clone(&last_message_time);
 
-                    match serde_json::from_str::<WsOrderBookMessage>(&text) {
-                        Ok(orderbook_msg) => {
-                            if tx.send(orderbook_msg).is_err() {
-                                warn!("Receiver dropped, closing connection");
-                                break;
+        // Ping interval timer
+        let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping_interval.tick().await; // First tick completes immediately
+
+        // Timeout check interval
+        let mut timeout_check = interval(Duration::from_secs(10));
+        timeout_check.tick().await;
+
+        // Parse error tracking
+        let mut consecutive_parse_errors = 0;
+
+        loop {
+            tokio::select! {
+                // Handle incoming messages
+                msg = ws_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received message: {}", text);
+
+                            match serde_json::from_str::<WsOrderBookMessage>(&text) {
+                                Ok(orderbook_msg) => {
+                                    consecutive_parse_errors = 0; // Reset on success
+                                    if tx.send(orderbook_msg).is_err() {
+                                        warn!("Receiver dropped, closing connection");
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    consecutive_parse_errors += 1;
+                                    error!("Failed to parse message ({}/{}): {} - Error: {}",
+                                           consecutive_parse_errors, MAX_CONSECUTIVE_PARSE_ERRORS, text, e);
+
+                                    if consecutive_parse_errors >= MAX_CONSECUTIVE_PARSE_ERRORS {
+                                        error!("Too many consecutive parse errors ({}), reconnecting", consecutive_parse_errors);
+                                        return Err(ConnectorError::ApiError(
+                                            format!("Too many consecutive parse errors: {}", consecutive_parse_errors)
+                                        ));
+                                    }
+                                }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to parse message: {} - Error: {}", text, e);
+                        Some(Ok(Message::Ping(data))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received ping, sending pong");
+                            if let Err(e) = ws_stream.send(Message::Pong(data)).await {
+                                error!("Failed to send pong: {}", e);
+                                return Err(ConnectorError::WebSocket(e));
+                            }
                         }
+                        Some(Ok(Message::Pong(_))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received pong");
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            info!("WebSocket closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            return Err(ConnectorError::WebSocket(e));
+                        }
+                        None => {
+                            warn!("WebSocket stream ended");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    debug!("Received ping, sending pong");
-                    ws_stream.send(Message::Pong(data)).await?;
+
+                // Send periodic pings
+                _ = ping_interval.tick() => {
+                    debug!("Sending proactive ping");
+                    if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
+                        error!("Failed to send ping: {}", e);
+                        return Err(ConnectorError::WebSocket(e));
+                    }
                 }
-                Ok(Message::Pong(_)) => {
-                    debug!("Received pong");
+
+                // Check for inactivity timeout
+                _ = timeout_check.tick() => {
+                    let last_msg = *last_message_clone.lock().await;
+                    let elapsed = last_msg.elapsed();
+                    if elapsed > Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
+                        warn!("Inactivity timeout: no messages for {:?}, closing connection", elapsed);
+                        return Err(ConnectorError::ApiError(format!(
+                            "Connection inactive for {:?}", elapsed
+                        )));
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("WebSocket closed by server");
-                    break;
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    return Err(ConnectorError::WebSocket(e));
-                }
-                _ => {}
             }
         }
 
@@ -301,42 +418,102 @@ impl WebSocketClient {
         mut ws_stream: WsStream,
         tx: mpsc::UnboundedSender<PublicTrade>,
     ) -> Result<()> {
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("Received trades message: {}", text);
+        let last_message_time = Arc::new(Mutex::new(Instant::now()));
+        let last_message_clone = Arc::clone(&last_message_time);
 
-                    match serde_json::from_str::<WsPublicTradesMessage>(&text) {
-                        Ok(trades_msg) => {
-                            // Send each trade individually
-                            for trade in trades_msg.data {
-                                if tx.send(trade).is_err() {
-                                    warn!("Receiver dropped, closing connection");
-                                    return Ok(());
+        // Ping interval timer
+        let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping_interval.tick().await; // First tick completes immediately
+
+        // Timeout check interval
+        let mut timeout_check = interval(Duration::from_secs(10));
+        timeout_check.tick().await;
+
+        // Parse error tracking
+        let mut consecutive_parse_errors = 0;
+
+        loop {
+            tokio::select! {
+                // Handle incoming messages
+                msg = ws_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received trades message: {}", text);
+
+                            match serde_json::from_str::<WsPublicTradesMessage>(&text) {
+                                Ok(trades_msg) => {
+                                    consecutive_parse_errors = 0; // Reset on success
+                                    // Send each trade individually
+                                    for trade in trades_msg.data {
+                                        if tx.send(trade).is_err() {
+                                            warn!("Receiver dropped, closing connection");
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    consecutive_parse_errors += 1;
+                                    error!("Failed to parse trades message ({}/{}): {} - Error: {}",
+                                           consecutive_parse_errors, MAX_CONSECUTIVE_PARSE_ERRORS, text, e);
+
+                                    if consecutive_parse_errors >= MAX_CONSECUTIVE_PARSE_ERRORS {
+                                        error!("Too many consecutive parse errors ({}), reconnecting", consecutive_parse_errors);
+                                        return Err(ConnectorError::ApiError(
+                                            format!("Too many consecutive parse errors: {}", consecutive_parse_errors)
+                                        ));
+                                    }
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to parse trades message: {} - Error: {}", text, e);
+                        Some(Ok(Message::Ping(data))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received ping, sending pong");
+                            if let Err(e) = ws_stream.send(Message::Pong(data)).await {
+                                error!("Failed to send pong: {}", e);
+                                return Err(ConnectorError::WebSocket(e));
+                            }
                         }
+                        Some(Ok(Message::Pong(_))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received pong");
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            info!("WebSocket closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            return Err(ConnectorError::WebSocket(e));
+                        }
+                        None => {
+                            warn!("WebSocket stream ended");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    debug!("Received ping, sending pong");
-                    ws_stream.send(Message::Pong(data)).await?;
+
+                // Send periodic pings
+                _ = ping_interval.tick() => {
+                    debug!("Sending proactive ping");
+                    if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
+                        error!("Failed to send ping: {}", e);
+                        return Err(ConnectorError::WebSocket(e));
+                    }
                 }
-                Ok(Message::Pong(_)) => {
-                    debug!("Received pong");
+
+                // Check for inactivity timeout
+                _ = timeout_check.tick() => {
+                    let last_msg = *last_message_clone.lock().await;
+                    let elapsed = last_msg.elapsed();
+                    if elapsed > Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
+                        warn!("Inactivity timeout: no messages for {:?}, closing connection", elapsed);
+                        return Err(ConnectorError::ApiError(format!(
+                            "Connection inactive for {:?}", elapsed
+                        )));
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("WebSocket closed by server");
-                    break;
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    return Err(ConnectorError::WebSocket(e));
-                }
-                _ => {}
             }
         }
 
@@ -348,47 +525,94 @@ impl WebSocketClient {
         mut ws_stream: WsStream,
         tx: mpsc::UnboundedSender<AccountUpdate>,
     ) -> Result<()> {
-        while let Some(msg) = ws_stream.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    debug!("Received account update message: {}", text);
+        let last_message_time = Arc::new(Mutex::new(Instant::now()));
+        let last_message_clone = Arc::clone(&last_message_time);
 
-                    match serde_json::from_str::<WsAccountUpdateMessage>(&text) {
-                        Ok(update_msg) => {
-                            // Parse the data field based on update_type
-                            match update_msg.parse_update() {
-                                Ok(account_update) => {
-                                    if tx.send(account_update).is_err() {
-                                        warn!("Receiver dropped, closing connection");
-                                        return Ok(());
+        // Ping interval timer
+        let mut ping_interval = interval(Duration::from_secs(PING_INTERVAL_SECS));
+        ping_interval.tick().await; // First tick completes immediately
+
+        // Timeout check interval
+        let mut timeout_check = interval(Duration::from_secs(10));
+        timeout_check.tick().await;
+
+        loop {
+            tokio::select! {
+                // Handle incoming messages
+                msg = ws_stream.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received account update message: {}", text);
+
+                            match serde_json::from_str::<WsAccountUpdateMessage>(&text) {
+                                Ok(update_msg) => {
+                                    // Parse the data field based on update_type
+                                    match update_msg.parse_update() {
+                                        Ok(account_update) => {
+                                            if tx.send(account_update).is_err() {
+                                                warn!("Receiver dropped, closing connection");
+                                                return Ok(());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to parse account update data: {} - Error: {}", text, e);
+                                        }
                                     }
                                 }
                                 Err(e) => {
-                                    error!("Failed to parse account update data: {} - Error: {}", text, e);
+                                    error!("Failed to parse account update message: {} - Error: {}", text, e);
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Failed to parse account update message: {} - Error: {}", text, e);
+                        Some(Ok(Message::Ping(data))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received ping, sending pong");
+                            if let Err(e) = ws_stream.send(Message::Pong(data)).await {
+                                error!("Failed to send pong: {}", e);
+                                return Err(ConnectorError::WebSocket(e));
+                            }
                         }
+                        Some(Ok(Message::Pong(_))) => {
+                            *last_message_time.lock().await = Instant::now();
+                            debug!("Received pong");
+                        }
+                        Some(Ok(Message::Close(_))) => {
+                            info!("WebSocket closed by server");
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            error!("WebSocket error: {}", e);
+                            return Err(ConnectorError::WebSocket(e));
+                        }
+                        None => {
+                            warn!("WebSocket stream ended");
+                            break;
+                        }
+                        _ => {}
                     }
                 }
-                Ok(Message::Ping(data)) => {
-                    debug!("Received ping, sending pong");
-                    ws_stream.send(Message::Pong(data)).await?;
+
+                // Send periodic pings
+                _ = ping_interval.tick() => {
+                    debug!("Sending proactive ping");
+                    if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
+                        error!("Failed to send ping: {}", e);
+                        return Err(ConnectorError::WebSocket(e));
+                    }
                 }
-                Ok(Message::Pong(_)) => {
-                    debug!("Received pong");
+
+                // Check for inactivity timeout
+                _ = timeout_check.tick() => {
+                    let last_msg = *last_message_clone.lock().await;
+                    let elapsed = last_msg.elapsed();
+                    if elapsed > Duration::from_secs(INACTIVITY_TIMEOUT_SECS) {
+                        warn!("Inactivity timeout: no messages for {:?}, closing connection", elapsed);
+                        return Err(ConnectorError::ApiError(format!(
+                            "Connection inactive for {:?}", elapsed
+                        )));
+                    }
                 }
-                Ok(Message::Close(_)) => {
-                    info!("WebSocket closed by server");
-                    break;
-                }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    return Err(ConnectorError::WebSocket(e));
-                }
-                _ => {}
             }
         }
 
