@@ -17,7 +17,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-const MAX_ROWS_PER_FILE: usize = 100_000; // Close file and start new one at 100K rows
+const MAX_ROWS_PER_FILE: usize = 25_000; // Close file and start new one at 25K rows
 const FLUSH_BATCH_SIZE: usize = 100; // Write batch every 100 rows
 const FLUSH_INTERVAL_SECS: u64 = 10; // Or write every 10 seconds
 
