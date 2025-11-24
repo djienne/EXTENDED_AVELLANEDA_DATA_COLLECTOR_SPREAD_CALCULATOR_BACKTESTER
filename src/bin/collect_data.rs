@@ -404,30 +404,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Wait for Ctrl+C
-    match signal::ctrl_c().await {
-        Ok(()) => {
+    // Wait for shutdown signal
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
             println!();
             println!("🛑 Received Ctrl+C signal. Shutting down gracefully...");
+        },
+        _ = terminate => {
             println!();
+            println!("🛑 Received SIGTERM signal. Shutting down gracefully...");
+        },
+    }
 
-            // Save final state for all collectors
-            for collector in collectors_arc.iter() {
-                println!("💾 Saving final state for {}...", collector.market);
-                if let Err(e) = collector.shutdown().await {
-                    eprintln!("Error saving final state for {}: {}", collector.market, e);
-                } else {
-                    println!("✅ Saved state for {}", collector.market);
-                }
-            }
+    println!();
 
-            println!();
-            println!("✅ Data collection stopped gracefully");
-            println!("💡 You can restart the service - it will resume from where it left off");
-        }
-        Err(err) => {
-            eprintln!("Error waiting for Ctrl+C: {}", err);
+    // Save final state for all collectors
+    for collector in collectors_arc.iter() {
+        println!("💾 Saving final state for {}...", collector.market);
+        if let Err(e) = collector.shutdown().await {
+            eprintln!("Error saving final state for {}: {}", collector.market, e);
+        } else {
+            println!("✅ Saved state for {}", collector.market);
         }
     }
+
+    println!();
+    println!("✅ Data collection stopped gracefully");
+    println!("💡 You can restart the service - it will resume from where it left off");
 
     Ok(())
 }
