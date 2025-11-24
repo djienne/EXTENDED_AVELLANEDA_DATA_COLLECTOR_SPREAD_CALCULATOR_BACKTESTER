@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut calibration_engine = CalibrationEngine::new(&config);
 
     // 4. Prepare Output
-    let mut output_file = File::create("data/eth_usd/as_results.csv")?;;
+    let mut output_file = File::create("data/eth_usd/as_results.csv")?;
     writeln!(output_file, "timestamp,datetime,mid_price,volatility,kappa,A,gamma,optimal_spread_bps,bid_spread_bps,ask_spread_bps,bid_price,ask_price,reservation_price")?;
 
     // Print Header to Terminal
@@ -65,6 +65,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Track last quote for final output
     let mut last_quote: Option<extended_data_collector::model_types::EffectiveQuote> = None;
     let mut last_ts = 0;
+
+    // Collect statistics
+    let mut total_spread_bps_vec: Vec<f64> = Vec::new();
+    let mut bid_spread_bps_vec: Vec<f64> = Vec::new();
+    let mut ask_spread_bps_vec: Vec<f64> = Vec::new();
+    let mut volatility_vec: Vec<f64> = Vec::new();
+    let mut kappa_vec: Vec<f64> = Vec::new();
+    let mut a_vec: Vec<f64> = Vec::new();
+    let mut gamma_vec: Vec<f64> = Vec::new();
 
     // 6. Process Orderbook Snapshots
     for result in loader.orderbooks_iter()? {
@@ -113,6 +122,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let total_spread_bps = (spread / reservation_price) * Decimal::from(10000);
                     let bid_spread_bps = ((reservation_price - bid_price) / reservation_price) * Decimal::from(10000);
                     let ask_spread_bps = ((ask_price - reservation_price) / reservation_price) * Decimal::from(10000);
+
+                    // Collect statistics
+                    total_spread_bps_vec.push(total_spread_bps.to_f64().unwrap_or(0.0));
+                    bid_spread_bps_vec.push(bid_spread_bps.to_f64().unwrap_or(0.0));
+                    ask_spread_bps_vec.push(ask_spread_bps.to_f64().unwrap_or(0.0));
+                    volatility_vec.push(cal_result.volatility.to_f64().unwrap_or(0.0));
+                    kappa_vec.push(cal_result.kappa.to_f64().unwrap_or(0.0));
+                    a_vec.push(cal_result.a.to_f64().unwrap_or(0.0));
+                    gamma_vec.push(optimal.gamma.to_f64().unwrap_or(0.0));
 
                     // Output to CSV
                     writeln!(
@@ -166,6 +184,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bid_spread_bps = ((reservation_price - bid_price) / reservation_price) * Decimal::from(10000);
             let ask_spread_bps = ((ask_price - reservation_price) / reservation_price) * Decimal::from(10000);
 
+            // Collect statistics for final calculation
+            total_spread_bps_vec.push(total_spread_bps.to_f64().unwrap_or(0.0));
+            bid_spread_bps_vec.push(bid_spread_bps.to_f64().unwrap_or(0.0));
+            ask_spread_bps_vec.push(ask_spread_bps.to_f64().unwrap_or(0.0));
+            volatility_vec.push(cal_result.volatility.to_f64().unwrap_or(0.0));
+            kappa_vec.push(cal_result.kappa.to_f64().unwrap_or(0.0));
+            a_vec.push(cal_result.a.to_f64().unwrap_or(0.0));
+            gamma_vec.push(optimal.gamma.to_f64().unwrap_or(0.0));
+
             writeln!(
                 output_file,
                 "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
@@ -181,6 +208,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    println!("{:-<155}", "");
     println!("Done! Results written to data/eth_usd/as_results.csv");
+
+    // Display Statistics
+    if !total_spread_bps_vec.is_empty() {
+        println!("\n{:=<80}", "");
+        println!("STATISTICS SUMMARY (n = {})", total_spread_bps_vec.len());
+        println!("{:=<80}", "");
+
+        println!("\n{:<20} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10}",
+                 "Metric", "Mean", "Median", "Std Dev", "Min", "Max");
+        println!("{:-<80}", "");
+
+        print_stats("Total Spread (bps)", &total_spread_bps_vec);
+        print_stats("Bid Spread (bps)", &bid_spread_bps_vec);
+        print_stats("Ask Spread (bps)", &ask_spread_bps_vec);
+        print_stats("Volatility", &volatility_vec);
+        print_stats("Kappa", &kappa_vec);
+        print_stats("A Parameter", &a_vec);
+        print_stats("Gamma", &gamma_vec);
+
+        println!("{:=<80}", "");
+    }
+
     Ok(())
+}
+
+fn print_stats(label: &str, data: &[f64]) {
+    if data.is_empty() {
+        return;
+    }
+
+    let mean = data.iter().sum::<f64>() / data.len() as f64;
+
+    let mut sorted = data.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.len() % 2 == 0 {
+        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+
+    let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64;
+    let std_dev = variance.sqrt();
+
+    let min = sorted.first().unwrap();
+    let max = sorted.last().unwrap();
+
+    println!("{:<20} | {:>10.4} | {:>10.4} | {:>10.4} | {:>10.4} | {:>10.4}",
+             label, mean, median, std_dev, min, max);
 }
