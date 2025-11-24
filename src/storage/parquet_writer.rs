@@ -17,8 +17,9 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-const DEFAULT_BATCH_SIZE: usize = 100_000; // 100K rows per file (~2MB compressed)
-const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
+const MAX_ROWS_PER_FILE: usize = 100_000; // 100K rows per file before starting new file
+const FLUSH_BATCH_SIZE: usize = 1_000; // Flush every 1K rows to disk
+const FLUSH_INTERVAL_SECS: u64 = 30; // Flush every 30 seconds for safety
 
 fn min_quantity_threshold() -> Decimal {
     Decimal::new(1, 9) // 1e-9
@@ -44,24 +45,20 @@ pub struct OrderbookParquetWriter {
     market: String,
     orderbook_state: Arc<Mutex<Option<OrderbookState>>>,
 
-    // Batching
+    // Batching and file management
     batch: Arc<Mutex<Vec<FlattenedSnapshot>>>,
-    batch_size: usize,
     last_flush: Arc<Mutex<Instant>>,
     part_counter: Arc<Mutex<usize>>,
+    
+    // Current file tracking
+    current_writer: Arc<Mutex<Option<ArrowWriter<File>>>>,
+    current_file_rows: Arc<Mutex<usize>>,
+    current_file_start_ts: Arc<Mutex<Option<i64>>>,
+    current_file_start_seq: Arc<Mutex<Option<i64>>>,
 }
 
 impl OrderbookParquetWriter {
     pub fn new(data_dir: &Path, market: &str, max_levels: usize) -> Result<Self> {
-        Self::new_with_batch_size(data_dir, market, max_levels, DEFAULT_BATCH_SIZE)
-    }
-
-    pub fn new_with_batch_size(
-        data_dir: &Path,
-        market: &str,
-        max_levels: usize,
-        batch_size: usize,
-    ) -> Result<Self> {
         // Create data directory if it doesn't exist
         fs::create_dir_all(data_dir)?;
 
@@ -101,8 +98,8 @@ impl OrderbookParquetWriter {
         let state = Arc::new(Mutex::new(state));
 
         info!(
-            "Initialized Parquet writer for {} (max_levels={}, batch_size={})",
-            market, max_levels, batch_size
+            "Initialized Parquet writer for {} (max_levels={}, flush_interval={}s)",
+            market, max_levels, FLUSH_INTERVAL_SECS
         );
 
         Ok(Self {
@@ -112,10 +109,13 @@ impl OrderbookParquetWriter {
             max_levels,
             market: market.to_string(),
             orderbook_state: Arc::new(Mutex::new(None)),
-            batch: Arc::new(Mutex::new(Vec::with_capacity(batch_size))),
-            batch_size,
+            batch: Arc::new(Mutex::new(Vec::with_capacity(FLUSH_BATCH_SIZE))),
             last_flush: Arc::new(Mutex::new(Instant::now())),
             part_counter: Arc::new(Mutex::new(0)),
+            current_writer: Arc::new(Mutex::new(None)),
+            current_file_rows: Arc::new(Mutex::new(0)),
+            current_file_start_ts: Arc::new(Mutex::new(None)),
+            current_file_start_seq: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -239,7 +239,7 @@ impl OrderbookParquetWriter {
         let should_flush = {
             let mut batch = self.batch.lock().await;
             batch.push(flattened);
-            batch.len() >= self.batch_size
+            batch.len() >= FLUSH_BATCH_SIZE
         };
 
         // Update state
@@ -256,7 +256,7 @@ impl OrderbookParquetWriter {
             if state.orderbook_updates_count % 100 == 0 {
                 let state_path = self.parts_dir.parent().unwrap().join("state.json");
                 if let Err(e) = state.save_to_file(&state_path) {
-                    warn!("Failed to save state: {}", e);
+                   warn!("Failed to save state: {}", e);
                 }
             }
         }
@@ -276,50 +276,76 @@ impl OrderbookParquetWriter {
             if batch.is_empty() {
                 return Ok(());
             }
-            std::mem::replace(&mut *batch, Vec::with_capacity(self.batch_size))
+            std::mem::replace(&mut *batch, Vec::with_capacity(FLUSH_BATCH_SIZE))
         };
 
         if batch.is_empty() {
             return Ok(());
         }
 
-        // Generate filename
-        let first_ts = batch[0].timestamp_ms;
-        let first_seq = batch[0].seq;
-        let part_num = {
-            let mut counter = self.part_counter.lock().await;
-            let num = *counter;
-            *counter += 1;
-            num
-        };
-
-        let filename = format!("part_{:013}_{:010}_{:06}.parquet", first_ts, first_seq, part_num);
-        let file_path = self.parts_dir.join(&filename);
-
-        // Build Arrow schema
+        let batch_size = batch.len();
         let schema = self.build_schema();
 
-        // Write Parquet file with Snappy compression
-        let file = File::create(&file_path)?;
-        let props = WriterProperties::builder()
-            .set_compression(Compression::SNAPPY)
-            .build();
+        // Check if we need to open a new file
+        let mut writer_lock = self.current_writer.lock().await;
+        let mut file_rows_lock = self.current_file_rows.lock().await;
+        let mut start_ts_lock = self.current_file_start_ts.lock().await;
+        let mut start_seq_lock = self.current_file_start_seq.lock().await;
 
-        let mut writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create writer: {}", e)))?;
+        // If no writer or file would exceed MAX_ROWS_PER_FILE, create new file
+        if writer_lock.is_none() || (*file_rows_lock + batch_size) > MAX_ROWS_PER_FILE {
+            // Close current writer if exists
+            if let Some(mut old_writer) = writer_lock.take() {
+                old_writer.close()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+                info!(
+                    "Closed parquet file with {} rows (limit: {})",
+                    *file_rows_lock, MAX_ROWS_PER_FILE
+                );
+            }
 
-        // Convert batch to RecordBatch
+            // Generate filename for new file
+            let first_ts = batch[0].timestamp_ms;
+            let first_seq = batch[0].seq;
+            let part_num = {
+                let mut counter = self.part_counter.lock().await;
+                let num = *counter;
+                *counter += 1;
+                num
+            };
+
+            let filename = format!("part_{:013}_{:010}_{:06}.parquet", first_ts, first_seq, part_num);
+            let file_path = self.parts_dir.join(&filename);
+
+            // Create new file and writer
+            let file = File::create(&file_path)?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::SNAPPY)
+                .build();
+
+            let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create writer: {}", e)))?;
+
+            *writer_lock = Some(new_writer);
+            *file_rows_lock = 0;
+            *start_ts_lock = Some(first_ts);
+            *start_seq_lock = Some(first_seq);
+
+            info!("Created new parquet file: {}", filename);
+        }
+
+        // Write batch to current file
         let record_batch = self.build_record_batch(&batch, &schema)?;
-        writer.write(&record_batch)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
-        writer.close()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+        if let Some(writer) = writer_lock.as_mut() {
+            writer.write(&record_batch)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
+            *file_rows_lock += batch_size;
 
-        info!(
-            "Flushed {} orderbook snapshots to {}",
-            batch.len(),
-            filename
-        );
+            debug!(
+                "Flushed {} rows to current file (total: {}/{})",
+                batch_size, *file_rows_lock, MAX_ROWS_PER_FILE
+            );
+        }
 
         // Update last flush time
         *self.last_flush.lock().await = Instant::now();
@@ -403,6 +429,15 @@ impl OrderbookParquetWriter {
     pub async fn save_state(&self) -> Result<()> {
         // Flush any remaining batch
         self.flush_batch().await?;
+
+        // Close current writer if open
+        let mut writer_lock = self.current_writer.lock().await;
+        if let Some(mut writer) = writer_lock.take() {
+            let file_rows = *self.current_file_rows.lock().await;
+            writer.close()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+            info!("Closed final parquet file with {} rows", file_rows);
+        }
 
         let state = self.state.lock().await;
         let state_path = self.parts_dir.parent().unwrap().join("state.json");
