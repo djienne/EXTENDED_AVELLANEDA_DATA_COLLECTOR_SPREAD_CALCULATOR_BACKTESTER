@@ -17,8 +17,8 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-const DEFAULT_BATCH_SIZE: usize = 5000;
-const FLUSH_INTERVAL_SECS: u64 = 30;
+const DEFAULT_BATCH_SIZE: usize = 100_000; // 100K rows per file (~2MB compressed)
+const FLUSH_INTERVAL_SECS: u64 = 300; // 5 minutes
 
 fn min_quantity_threshold() -> Decimal {
     Decimal::new(1, 9) // 1e-9
