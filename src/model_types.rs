@@ -61,10 +61,10 @@ fn default_num_threads() -> usize {
 
 impl Default for ASConfig {
     fn default() -> Self {
-        use rust_decimal::prelude::FromStr;
         Self {
             risk_aversion_gamma: 0.5,
-            effective_volume_threshold: Decimal::from_str("1000.0").unwrap(),
+            // Use integer conversion to avoid potential parse failures
+            effective_volume_threshold: Decimal::from(1000),
             calibration_window_seconds: 3600, // 1 hour
             recalibration_interval_seconds: 60, // 1 minute
             inventory_horizon_seconds: 60, // 1 minute (matches tight crypto market spreads)
@@ -107,7 +107,8 @@ pub struct ModelParams {
     /// Order arrival intensity decay (kappa)
     pub kappa: f64,
     /// Base order arrival intensity (A)
-    pub A: f64,
+    /// Note: Using snake_case per Rust convention
+    pub a: f64,
     /// Risk aversion (gamma) from config
     pub gamma: f64,
 }
@@ -131,4 +132,24 @@ pub struct TradeEvent {
     pub price: Decimal,
     pub quantity: Decimal,
     pub is_buyer_maker: bool, // true if buyer was maker (sell side aggressor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ASConfig::default();
+        assert_eq!(config.effective_volume_threshold, Decimal::from(1000));
+        assert_eq!(config.calibration_window_seconds, 3600);
+        assert_eq!(config.num_threads, 4);
+    }
+
+    #[test]
+    fn test_gamma_mode_serialization() {
+        let mode = GammaMode::InventoryScaled;
+        let json = serde_json::to_string(&mode).unwrap();
+        assert_eq!(json, "\"inventory_scaled\"");
+    }
 }

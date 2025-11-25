@@ -3,12 +3,13 @@
 /// This module provides a stateful calibration engine that manages rolling windows
 /// of prices and trades, and performs periodic recalibration of volatility (σ) and
 /// intensity parameters (κ, A).
-///
-/// Eliminates code duplication across backtest, calculate_spread, and other binaries.
 
 use crate::calibration::{calculate_volatility, fit_intensity_parameters};
 use crate::model_types::{ASConfig, TradeEvent};
 use rust_decimal::Decimal;
+
+/// Minimum number of price observations required for calibration
+const MIN_PRICES_FOR_CALIBRATION: usize = 10;
 
 /// Result of a calibration run
 #[derive(Debug, Clone)]
@@ -29,8 +30,6 @@ pub struct CalibrationResult {
 pub struct CalibrationEngine {
     /// Rolling window of prices for volatility calculation (timestamp, price)
     calibration_prices: Vec<(u64, Decimal)>,
-    /// Rolling window of just prices (for volatility calculation)
-    window_prices: Vec<Decimal>,
     /// Rolling window of trades for intensity parameter fitting
     window_trades: Vec<TradeEvent>,
     /// Current kappa parameter
@@ -48,13 +47,17 @@ pub struct CalibrationEngine {
 impl CalibrationEngine {
     /// Create a new calibration engine
     pub fn new(config: &ASConfig) -> Self {
-        let calibration_window_ms = (config.calibration_window_seconds * 1000) as u64;
-        let recalibration_interval_ms = (config.recalibration_interval_seconds * 1000) as u64;
+        // Cast before multiply to prevent overflow
+        let calibration_window_ms = (config.calibration_window_seconds as u64).saturating_mul(1000);
+        let recalibration_interval_ms = (config.recalibration_interval_seconds as u64).saturating_mul(1000);
+
+        // Estimate capacity: ~1 price per second for the window duration
+        let estimated_prices = (config.calibration_window_seconds as usize).min(10_000);
+        let estimated_trades = estimated_prices * 10; // Rough estimate
 
         Self {
-            calibration_prices: Vec::new(),
-            window_prices: Vec::new(),
-            window_trades: Vec::new(),
+            calibration_prices: Vec::with_capacity(estimated_prices),
+            window_trades: Vec::with_capacity(estimated_trades),
             kappa: 10.0,  // Default starting value
             a: 100.0,     // Default starting value
             last_calibration_ts: None,
@@ -63,13 +66,16 @@ impl CalibrationEngine {
         }
     }
 
-    /// Add a price observation to the calibration windows
+    /// Add a price observation to the calibration window
+    #[inline]
     pub fn add_price(&mut self, timestamp: u64, price: Decimal) {
         self.calibration_prices.push((timestamp, price));
-        self.window_prices.push(price);
     }
 
     /// Add a trade to the calibration window
+    /// 
+    /// Note: Takes ownership of the trade. Clone before calling if you need to retain it.
+    #[inline]
     pub fn add_trade(&mut self, trade: TradeEvent) {
         self.window_trades.push(trade);
     }
@@ -81,13 +87,6 @@ impl CalibrationEngine {
             current_ts.saturating_sub(*ts) <= self.calibration_window_ms
         });
 
-        // Keep window_prices in sync (same length as calibration_prices)
-        let expected_len = self.calibration_prices.len();
-        if self.window_prices.len() > expected_len {
-            let to_remove = self.window_prices.len() - expected_len;
-            self.window_prices.drain(0..to_remove);
-        }
-
         // Remove trades older than calibration window
         self.window_trades.retain(|t| {
             current_ts.saturating_sub(t.timestamp) <= self.calibration_window_ms
@@ -95,13 +94,21 @@ impl CalibrationEngine {
     }
 
     /// Check if it's time to recalibrate
+    #[inline]
     pub fn should_recalibrate(&self, current_ts: u64) -> bool {
         if let Some(last_cal_ts) = self.last_calibration_ts {
             current_ts >= last_cal_ts + self.recalibration_interval_ms
         } else {
             // First calibration: wait until we have enough data
-            self.calibration_prices.len() >= 10
+            self.calibration_prices.len() >= MIN_PRICES_FOR_CALIBRATION
         }
+    }
+
+    /// Extract prices from calibration_prices for volatility calculation
+    /// Avoids storing duplicate data
+    #[inline]
+    fn get_prices(&self) -> Vec<Decimal> {
+        self.calibration_prices.iter().map(|(_, p)| *p).collect()
     }
 
     /// Perform calibration and return results
@@ -118,10 +125,13 @@ impl CalibrationEngine {
 
         // Calculate actual window duration
         let start_ts = self.calibration_prices.first().map(|(ts, _)| *ts).unwrap_or(current_ts);
-        let actual_duration_sec = ((current_ts - start_ts) as f64 / 1000.0).max(1.0);
+        let actual_duration_sec = ((current_ts.saturating_sub(start_ts)) as f64 / 1000.0).max(1.0);
+
+        // Extract prices for volatility calculation
+        let prices = self.get_prices();
 
         // Calculate volatility
-        let volatility = calculate_volatility(&self.window_prices, actual_duration_sec);
+        let volatility = calculate_volatility(&prices, actual_duration_sec);
 
         // Fit intensity parameters
         let (new_kappa, new_a) = fit_intensity_parameters(
@@ -149,28 +159,42 @@ impl CalibrationEngine {
     }
 
     /// Get current kappa parameter
+    #[inline]
     pub fn kappa(&self) -> f64 {
         self.kappa
     }
 
     /// Get current A parameter
+    #[inline]
     pub fn a(&self) -> f64 {
         self.a
     }
 
     /// Get last calibration timestamp
+    #[inline]
     pub fn last_calibration_ts(&self) -> Option<u64> {
         self.last_calibration_ts
     }
 
     /// Get number of prices in calibration window
+    #[inline]
     pub fn price_count(&self) -> usize {
         self.calibration_prices.len()
     }
 
     /// Get number of trades in calibration window
+    #[inline]
     pub fn trade_count(&self) -> usize {
         self.window_trades.len()
+    }
+
+    /// Reset the engine state (useful for reusing across multiple backtests)
+    pub fn reset(&mut self) {
+        self.calibration_prices.clear();
+        self.window_trades.clear();
+        self.kappa = 10.0;
+        self.a = 100.0;
+        self.last_calibration_ts = None;
     }
 }
 
@@ -179,9 +203,17 @@ mod tests {
     use super::*;
     use rust_decimal::prelude::*;
 
+    fn make_test_config() -> ASConfig {
+        ASConfig {
+            calibration_window_seconds: 3600,
+            recalibration_interval_seconds: 60,
+            ..ASConfig::default()
+        }
+    }
+
     #[test]
     fn test_calibration_engine_basic() {
-        let config = ASConfig::default();
+        let config = make_test_config();
         let mut engine = CalibrationEngine::new(&config);
 
         assert_eq!(engine.price_count(), 0);
@@ -199,21 +231,41 @@ mod tests {
 
     #[test]
     fn test_window_pruning() {
-        let config = ASConfig::default();
+        let config = make_test_config();
         let mut engine = CalibrationEngine::new(&config);
 
-        // Add prices spanning 2 hours
+        // Add prices spanning 2 hours (every minute)
         for i in 0..120 {
-            engine.add_price(i * 60_000, Decimal::from(2800 + i)); // Every minute
+            engine.add_price(i * 60_000, Decimal::from(2800 + i));
         }
 
         assert_eq!(engine.price_count(), 120);
 
-        // Prune to last hour (default window is 3600s)
-        let current_ts = 120 * 60_000;
+        // Prune at t=2 hours; should keep prices from t >= 1 hour
+        let current_ts = 120 * 60_000; // 7,200,000 ms
         engine.prune_windows(current_ts);
 
-        // Should keep only last hour
-        assert!(engine.price_count() <= 61); // 60 minutes + possibly 1 more
+        // Prices kept: timestamps >= 3,600,000 (minute 60 to 119 inclusive = 60 prices)
+        // Plus minute 120 if it existed, but we only added up to 119
+        assert!(engine.price_count() <= 61);
+        assert!(engine.price_count() >= 59); // Allow some tolerance
+    }
+
+    #[test]
+    fn test_reset() {
+        let config = make_test_config();
+        let mut engine = CalibrationEngine::new(&config);
+
+        for i in 0..20 {
+            engine.add_price(1000 + i * 1000, Decimal::from(2800 + i));
+        }
+
+        assert_eq!(engine.price_count(), 20);
+
+        engine.reset();
+
+        assert_eq!(engine.price_count(), 0);
+        assert_eq!(engine.trade_count(), 0);
+        assert_eq!(engine.last_calibration_ts(), None);
     }
 }
