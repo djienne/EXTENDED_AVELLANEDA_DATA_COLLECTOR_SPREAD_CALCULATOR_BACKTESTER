@@ -4,30 +4,85 @@ use extended_data_collector::metrics::calculate_effective_price;
 use extended_data_collector::calibration_engine::CalibrationEngine;
 use extended_data_collector::spread_model::compute_optimal_quote;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
 use std::path::Path;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufWriter, Write};
+use std::env;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Default paths
+const DEFAULT_CONFIG_PATH: &str = "config.json";
+const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades.csv";
+const DEFAULT_ORDERBOOK_PATH: &str = "data/eth_usd/orderbook_parts";
+const DEFAULT_OUTPUT_PATH: &str = "data/eth_usd/as_results.csv";
+
+fn print_usage(program: &str) {
+    eprintln!("Usage: {} [OPTIONS]", program);
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --config <path>      Path to config file (default: {})", DEFAULT_CONFIG_PATH);
+    eprintln!("  --trades <path>      Path to trades CSV (default: {})", DEFAULT_TRADES_PATH);
+    eprintln!("  --orderbook <path>   Path to orderbook directory (default: {})", DEFAULT_ORDERBOOK_PATH);
+    eprintln!("  --output <path>      Path to output CSV (default: {})", DEFAULT_OUTPUT_PATH);
+    eprintln!("  --help               Show this help message");
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+
+    // Parse command-line arguments
+    let mut config_path = DEFAULT_CONFIG_PATH.to_string();
+    let mut trades_path = DEFAULT_TRADES_PATH.to_string();
+    let mut orderbook_path = DEFAULT_ORDERBOOK_PATH.to_string();
+    let mut output_path = DEFAULT_OUTPUT_PATH.to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--config" => {
+                i += 1;
+                config_path = args.get(i).cloned().unwrap_or_default();
+            }
+            "--trades" => {
+                i += 1;
+                trades_path = args.get(i).cloned().unwrap_or_default();
+            }
+            "--orderbook" => {
+                i += 1;
+                orderbook_path = args.get(i).cloned().unwrap_or_default();
+            }
+            "--output" => {
+                i += 1;
+                output_path = args.get(i).cloned().unwrap_or_default();
+            }
+            "--help" | "-h" => {
+                print_usage(&args[0]);
+                return Ok(());
+            }
+            _ => {
+                eprintln!("Unknown argument: {}", args[i]);
+                print_usage(&args[0]);
+                return Err("Invalid arguments".into());
+            }
+        }
+        i += 1;
+    }
+
     // 1. Load Config
-    let config_path = "config.json";
-    let config = match std::fs::read_to_string(config_path) {
+    let config = match std::fs::read_to_string(&config_path) {
         Ok(contents) => {
             match serde_json::from_str::<ASConfig>(&contents) {
                 Ok(cfg) => {
                     println!("Loaded config from {}", config_path);
                     cfg
-                },
+                }
                 Err(e) => {
-                    eprintln!("Error parsing config.json: {}. Using defaults.", e);
+                    eprintln!("Error parsing {}: {}. Using defaults.", config_path, e);
                     ASConfig::default()
                 }
             }
-        },
+        }
         Err(_) => {
-            println!("config.json not found. Using defaults.");
+            println!("{} not found. Using defaults.", config_path);
             ASConfig::default()
         }
     };
@@ -36,18 +91,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Load Data
     println!("Loading data...");
     let loader = DataLoader::new(
-        Path::new("data/eth_usd/trades.csv"),
-        Path::new("data/eth_usd/orderbook_parts"),
+        Path::new(&trades_path),
+        Path::new(&orderbook_path),
     );
-    let trades = loader.get_trades()?;
-    // let orderbooks_count = loader.orderbooks_iter()?.count(); // Removed to prevent freezing
-    println!("Loaded {} trades", trades.len());
+    let all_trades = loader.get_trades()?;
+    println!("Loaded {} trades", all_trades.len());
 
     // 3. Initialize Calibration Engine
     let mut calibration_engine = CalibrationEngine::new(&config);
 
-    // 4. Prepare Output
-    let mut output_file = File::create("data/eth_usd/as_results.csv")?;
+    // 4. Prepare Output with buffered writer
+    let file = File::create(&output_path)?;
+    let mut output_file = BufWriter::new(file);
     writeln!(output_file, "timestamp,datetime,mid_price,volatility,kappa,A,gamma,optimal_spread_bps,bid_spread_bps,ask_spread_bps,bid_price,ask_price,reservation_price")?;
 
     // Print Header to Terminal
@@ -58,22 +113,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!("{:-<155}", "");
 
-    // 5. Pre-load all trades for window processing
-    let all_trades = trades;
+    // 5. State tracking
     let mut trade_idx = 0;
-
-    // Track last quote for final output
     let mut last_quote: Option<extended_data_collector::model_types::EffectiveQuote> = None;
-    let mut last_ts = 0;
+    let mut last_ts: u64 = 0;
 
     // Collect statistics
-    let mut total_spread_bps_vec: Vec<f64> = Vec::new();
-    let mut bid_spread_bps_vec: Vec<f64> = Vec::new();
-    let mut ask_spread_bps_vec: Vec<f64> = Vec::new();
-    let mut volatility_vec: Vec<f64> = Vec::new();
-    let mut kappa_vec: Vec<f64> = Vec::new();
-    let mut a_vec: Vec<f64> = Vec::new();
-    let mut gamma_vec: Vec<f64> = Vec::new();
+    let mut stats = SpreadStats::new();
+
+    // Precompute constant
+    let bps_multiplier = Decimal::from(10000);
 
     // 6. Process Orderbook Snapshots
     for result in loader.orderbooks_iter()? {
@@ -103,60 +152,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if calibration_engine.should_recalibrate(current_ts) {
                 if let Some(cal_result) = calibration_engine.calibrate(current_ts, config.tick_size) {
                     // Compute optimal quote with zero inventory
-                    let inventory = Decimal::ZERO;
                     let optimal = compute_optimal_quote(
                         current_ts,
                         quote.mid,
-                        inventory,
+                        Decimal::ZERO,
                         cal_result.volatility,
                         cal_result.kappa,
                         &config,
                     );
 
-                    // Calculate spread metrics
-                    let spread = optimal.optimal_spread;
+                    // Calculate spread metrics with division-by-zero guard
                     let reservation_price = optimal.reservation_price;
-                    let bid_price = optimal.bid_price;
-                    let ask_price = optimal.ask_price;
+                    
+                    if reservation_price > Decimal::ZERO {
+                        let spread = optimal.optimal_spread;
+                        let bid_price = optimal.bid_price;
+                        let ask_price = optimal.ask_price;
 
-                    let total_spread_bps = (spread / reservation_price) * Decimal::from(10000);
-                    let bid_spread_bps = ((reservation_price - bid_price) / reservation_price) * Decimal::from(10000);
-                    let ask_spread_bps = ((ask_price - reservation_price) / reservation_price) * Decimal::from(10000);
+                        let total_spread_bps = (spread / reservation_price) * bps_multiplier;
+                        let bid_spread_bps = ((reservation_price - bid_price) / reservation_price) * bps_multiplier;
+                        let ask_spread_bps = ((ask_price - reservation_price) / reservation_price) * bps_multiplier;
 
-                    // Collect statistics
-                    total_spread_bps_vec.push(total_spread_bps.to_f64().unwrap_or(0.0));
-                    bid_spread_bps_vec.push(bid_spread_bps.to_f64().unwrap_or(0.0));
-                    ask_spread_bps_vec.push(ask_spread_bps.to_f64().unwrap_or(0.0));
-                    volatility_vec.push(cal_result.volatility.to_f64().unwrap_or(0.0));
-                    kappa_vec.push(cal_result.kappa.to_f64().unwrap_or(0.0));
-                    a_vec.push(cal_result.a.to_f64().unwrap_or(0.0));
-                    gamma_vec.push(optimal.gamma.to_f64().unwrap_or(0.0));
+                        // Collect statistics (these are already f64, no conversion needed)
+                        stats.add_sample(
+                            total_spread_bps.to_f64().unwrap_or(0.0),
+                            bid_spread_bps.to_f64().unwrap_or(0.0),
+                            ask_spread_bps.to_f64().unwrap_or(0.0),
+                            cal_result.volatility,
+                            cal_result.kappa,
+                            cal_result.a,
+                            optimal.gamma,
+                        );
 
-                    // Output to CSV
-                    writeln!(
-                        output_file,
-                        "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
-                        current_ts,
-                        "N/A",
-                        quote.mid,
-                        cal_result.volatility,
-                        cal_result.kappa,
-                        cal_result.a,
-                        optimal.gamma,
-                        total_spread_bps,
-                        bid_spread_bps,
-                        ask_spread_bps,
-                        bid_price,
-                        ask_price,
-                        reservation_price
-                    )?;
+                        // Output to CSV
+                        writeln!(
+                            output_file,
+                            "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                            current_ts,
+                            format_timestamp(current_ts),
+                            quote.mid,
+                            cal_result.volatility,
+                            cal_result.kappa,
+                            cal_result.a,
+                            optimal.gamma,
+                            total_spread_bps,
+                            bid_spread_bps,
+                            ask_spread_bps,
+                            bid_price,
+                            ask_price,
+                            reservation_price
+                        )?;
 
-                    // Output to terminal
-                    println!(
-                        "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
-                        current_ts, quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
-                        optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
-                    );
+                        // Output to terminal
+                        println!(
+                            "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
+                            current_ts, quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
+                            optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
+                        );
+                    }
                 }
             }
         }
@@ -165,97 +218,188 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 7. Final Output (for partial window at end)
     if let Some(quote) = last_quote {
         if let Some(cal_result) = calibration_engine.calibrate(last_ts, config.tick_size) {
-            let inventory = Decimal::ZERO;
             let optimal = compute_optimal_quote(
                 last_ts,
                 quote.mid,
-                inventory,
+                Decimal::ZERO,
                 cal_result.volatility,
                 cal_result.kappa,
                 &config,
             );
 
-            let spread = optimal.optimal_spread;
             let reservation_price = optimal.reservation_price;
-            let bid_price = optimal.bid_price;
-            let ask_price = optimal.ask_price;
+            
+            if reservation_price > Decimal::ZERO {
+                let spread = optimal.optimal_spread;
+                let bid_price = optimal.bid_price;
+                let ask_price = optimal.ask_price;
 
-            let total_spread_bps = (spread / reservation_price) * Decimal::from(10000);
-            let bid_spread_bps = ((reservation_price - bid_price) / reservation_price) * Decimal::from(10000);
-            let ask_spread_bps = ((ask_price - reservation_price) / reservation_price) * Decimal::from(10000);
+                let total_spread_bps = (spread / reservation_price) * bps_multiplier;
+                let bid_spread_bps = ((reservation_price - bid_price) / reservation_price) * bps_multiplier;
+                let ask_spread_bps = ((ask_price - reservation_price) / reservation_price) * bps_multiplier;
 
-            // Collect statistics for final calculation
-            total_spread_bps_vec.push(total_spread_bps.to_f64().unwrap_or(0.0));
-            bid_spread_bps_vec.push(bid_spread_bps.to_f64().unwrap_or(0.0));
-            ask_spread_bps_vec.push(ask_spread_bps.to_f64().unwrap_or(0.0));
-            volatility_vec.push(cal_result.volatility.to_f64().unwrap_or(0.0));
-            kappa_vec.push(cal_result.kappa.to_f64().unwrap_or(0.0));
-            a_vec.push(cal_result.a.to_f64().unwrap_or(0.0));
-            gamma_vec.push(optimal.gamma.to_f64().unwrap_or(0.0));
+                stats.add_sample(
+                    total_spread_bps.to_f64().unwrap_or(0.0),
+                    bid_spread_bps.to_f64().unwrap_or(0.0),
+                    ask_spread_bps.to_f64().unwrap_or(0.0),
+                    cal_result.volatility,
+                    cal_result.kappa,
+                    cal_result.a,
+                    optimal.gamma,
+                );
 
-            writeln!(
-                output_file,
-                "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
-                last_ts, "N/A", quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
-                optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price, reservation_price
-            )?;
+                writeln!(
+                    output_file,
+                    "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                    last_ts,
+                    format_timestamp(last_ts),
+                    quote.mid,
+                    cal_result.volatility,
+                    cal_result.kappa,
+                    cal_result.a,
+                    optimal.gamma,
+                    total_spread_bps,
+                    bid_spread_bps,
+                    ask_spread_bps,
+                    bid_price,
+                    ask_price,
+                    reservation_price
+                )?;
 
-            println!(
-                "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
-                last_ts, quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
-                optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
-            );
+                println!(
+                    "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
+                    last_ts, quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
+                    optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
+                );
+            }
         }
     }
 
+    // Flush the buffer
+    output_file.flush()?;
+
     println!("{:-<155}", "");
-    println!("Done! Results written to data/eth_usd/as_results.csv");
+    println!("Done! Results written to {}", output_path);
 
     // Display Statistics
-    if !total_spread_bps_vec.is_empty() {
-        println!("\n{:=<80}", "");
-        println!("STATISTICS SUMMARY (n = {})", total_spread_bps_vec.len());
-        println!("{:=<80}", "");
-
-        println!("\n{:<20} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10}",
-                 "Metric", "Mean", "Median", "Std Dev", "Min", "Max");
-        println!("{:-<80}", "");
-
-        print_stats("Total Spread (bps)", &total_spread_bps_vec);
-        print_stats("Bid Spread (bps)", &bid_spread_bps_vec);
-        print_stats("Ask Spread (bps)", &ask_spread_bps_vec);
-        print_stats("Volatility", &volatility_vec);
-        print_stats("Kappa", &kappa_vec);
-        print_stats("A Parameter", &a_vec);
-        print_stats("Gamma", &gamma_vec);
-
-        println!("{:=<80}", "");
-    }
+    stats.print_summary();
 
     Ok(())
 }
 
-fn print_stats(label: &str, data: &[f64]) {
-    if data.is_empty() {
-        return;
+/// Format timestamp as human-readable string
+fn format_timestamp(timestamp_ms: u64) -> String {
+    use chrono::{DateTime, Utc};
+    let seconds = (timestamp_ms / 1000) as i64;
+    let nanos = ((timestamp_ms % 1000) * 1_000_000) as u32;
+
+    match DateTime::<Utc>::from_timestamp(seconds, nanos) {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => "N/A".to_string(),
+    }
+}
+
+/// Statistics collector for spread metrics
+struct SpreadStats {
+    total_spread_bps: Vec<f64>,
+    bid_spread_bps: Vec<f64>,
+    ask_spread_bps: Vec<f64>,
+    volatility: Vec<f64>,
+    kappa: Vec<f64>,
+    a: Vec<f64>,
+    gamma: Vec<f64>,
+}
+
+impl SpreadStats {
+    fn new() -> Self {
+        Self {
+            total_spread_bps: Vec::new(),
+            bid_spread_bps: Vec::new(),
+            ask_spread_bps: Vec::new(),
+            volatility: Vec::new(),
+            kappa: Vec::new(),
+            a: Vec::new(),
+            gamma: Vec::new(),
+        }
     }
 
-    let mean = data.iter().sum::<f64>() / data.len() as f64;
+    fn add_sample(
+        &mut self,
+        total_spread: f64,
+        bid_spread: f64,
+        ask_spread: f64,
+        vol: f64,
+        kappa: f64,
+        a: f64,
+        gamma: f64,
+    ) {
+        self.total_spread_bps.push(total_spread);
+        self.bid_spread_bps.push(bid_spread);
+        self.ask_spread_bps.push(ask_spread);
+        self.volatility.push(vol);
+        self.kappa.push(kappa);
+        self.a.push(a);
+        self.gamma.push(gamma);
+    }
 
-    let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = if sorted.len() % 2 == 0 {
-        (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
-    } else {
-        sorted[sorted.len() / 2]
-    };
+    fn print_summary(&self) {
+        if self.total_spread_bps.is_empty() {
+            println!("\nNo data collected for statistics.");
+            return;
+        }
 
-    let variance = data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / data.len() as f64;
-    let std_dev = variance.sqrt();
+        println!("\n{:=<80}", "");
+        println!("STATISTICS SUMMARY (n = {})", self.total_spread_bps.len());
+        println!("{:=<80}", "");
 
-    let min = sorted.first().unwrap();
-    let max = sorted.last().unwrap();
+        println!(
+            "\n{:<20} | {:>10} | {:>10} | {:>10} | {:>10} | {:>10}",
+            "Metric", "Mean", "Median", "Std Dev", "Min", "Max"
+        );
+        println!("{:-<80}", "");
 
-    println!("{:<20} | {:>10.4} | {:>10.4} | {:>10.4} | {:>10.4} | {:>10.4}",
-             label, mean, median, std_dev, min, max);
+        Self::print_stats_row("Total Spread (bps)", &self.total_spread_bps);
+        Self::print_stats_row("Bid Spread (bps)", &self.bid_spread_bps);
+        Self::print_stats_row("Ask Spread (bps)", &self.ask_spread_bps);
+        Self::print_stats_row("Volatility", &self.volatility);
+        Self::print_stats_row("Kappa", &self.kappa);
+        Self::print_stats_row("A Parameter", &self.a);
+        Self::print_stats_row("Gamma", &self.gamma);
+
+        println!("{:=<80}", "");
+    }
+
+    fn print_stats_row(label: &str, data: &[f64]) {
+        if data.is_empty() {
+            return;
+        }
+
+        let n = data.len() as f64;
+        let mean = data.iter().sum::<f64>() / n;
+
+        let mut sorted = data.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let median = if sorted.len() % 2 == 0 {
+            (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2]) / 2.0
+        } else {
+            sorted[sorted.len() / 2]
+        };
+
+        // Sample standard deviation (n-1 denominator)
+        let variance = if data.len() > 1 {
+            data.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (data.len() - 1) as f64
+        } else {
+            0.0
+        };
+        let std_dev = variance.sqrt();
+
+        let min = sorted.first().copied().unwrap_or(0.0);
+        let max = sorted.last().copied().unwrap_or(0.0);
+
+        println!(
+            "{:<20} | {:>10.4} | {:>10.4} | {:>10.4} | {:>10.4} | {:>10.4}",
+            label, mean, median, std_dev, min, max
+        );
+    }
 }

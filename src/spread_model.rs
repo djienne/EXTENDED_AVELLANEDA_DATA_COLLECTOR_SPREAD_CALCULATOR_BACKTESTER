@@ -2,11 +2,17 @@ use crate::model_types::{ASConfig, GammaMode, OptimalQuote};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
 
+/// Maximum allowed gamma to prevent numerical instability
+const MAX_GAMMA_LIMIT: f64 = 1e6;
+
+/// Minimum gamma to prevent division issues
+const MIN_GAMMA: f64 = 1e-6;
+
 fn clamp_sigma(sigma_pct: f64, config: &ASConfig) -> f64 {
     let min_v = config.min_volatility;
     let max_v = config.max_volatility;
     if max_v > min_v {
-        sigma_pct.max(min_v).min(max_v)
+        sigma_pct.clamp(min_v, max_v)
     } else {
         sigma_pct
     }
@@ -56,39 +62,56 @@ pub fn compute_optimal_quote(
     } else {
         0.0
     };
-    let gamma_constant = config.risk_aversion_gamma.max(1e-6);
-    let gamma_from_shift = if sigma_sq > 1e-12 && t_horizon > 0.0 && config.max_inventory > 0.0 {
-        (config.max_shift_ticks * config.tick_size) / (sigma_sq * t_horizon * config.max_inventory)
-    } else {
-        gamma_constant
+    
+    let gamma_constant = config.risk_aversion_gamma.max(MIN_GAMMA);
+    
+    // Calculate gamma_from_shift with additional safeguards
+    let gamma_from_shift = {
+        let denominator = sigma_sq * t_horizon * config.max_inventory;
+        if sigma_sq > 1e-12 && t_horizon > 0.0 && config.max_inventory > 0.0 && denominator > 1e-12 {
+            let raw_gamma = (config.max_shift_ticks * config.tick_size) / denominator;
+            // Clamp to prevent extremely large values
+            raw_gamma.min(MAX_GAMMA_LIMIT)
+        } else {
+            gamma_constant
+        }
     };
 
     let mut gamma = match config.gamma_mode {
         GammaMode::Constant => gamma_constant,
-        GammaMode::InventoryScaled => (gamma_from_shift * inv_ratio).max(1e-6),
-        GammaMode::MaxShift => gamma_from_shift.max(1e-6),
+        GammaMode::InventoryScaled => (gamma_from_shift * inv_ratio).max(MIN_GAMMA),
+        GammaMode::MaxShift => gamma_from_shift.max(MIN_GAMMA),
     };
 
+    // Apply gamma bounds from config
     if config.gamma_max > config.gamma_min && config.gamma_max > 0.0 {
-        let min_g = config.gamma_min.max(1e-6);
-        let max_g = config.gamma_max;
-        gamma = gamma.max(min_g).min(max_g);
+        let min_g = config.gamma_min.max(MIN_GAMMA);
+        let max_g = config.gamma_max.min(MAX_GAMMA_LIMIT);
+        gamma = gamma.clamp(min_g, max_g);
     }
 
     let kappa_eff = if kappa > 0.0 { kappa } else { 10.0 };
     let term = 1.0 + (gamma / kappa_eff);
-    if term <= 0.0 {
-        gamma = gamma.max(1e-6);
-    }
+    
+    // Ensure term is positive for ln()
+    let term_safe = term.max(MIN_GAMMA);
 
     let vol_risk_term = gamma * sigma_sq * t_horizon;
-    let optimal_spread_f64 = vol_risk_term + (2.0 / gamma) * term.ln();
-    let mut spread = Decimal::from_f64(optimal_spread_f64).unwrap_or(Decimal::ZERO);
+    let optimal_spread_f64 = vol_risk_term + (2.0 / gamma) * term_safe.ln();
+    
+    // Validate the computed spread
+    let mut spread = if optimal_spread_f64.is_finite() && optimal_spread_f64 > 0.0 {
+        Decimal::from_f64(optimal_spread_f64).unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    
     if spread <= Decimal::ZERO || mid_price <= Decimal::ZERO {
         spread = Decimal::ZERO;
     }
 
-    if spread > Decimal::ZERO {
+    // Apply spread bounds in basis points
+    if spread > Decimal::ZERO && mid_price > Decimal::ZERO {
         let mut spread_bps = (spread / mid_price) * Decimal::from(10000);
         let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
 
@@ -101,21 +124,28 @@ pub fn compute_optimal_quote(
         };
 
         if max_bps > 0.0 {
-            let clamped_bps = spread_bps_f64.max(min_bps).min(max_bps);
+            let clamped_bps = spread_bps_f64.clamp(min_bps, max_bps);
             spread_bps = Decimal::from_f64(clamped_bps).unwrap_or(spread_bps);
             spread = (spread_bps * mid_price) / Decimal::from(10000);
         }
     }
 
+    // Calculate reservation price adjustment
     let risk_adjustment_f64 = inventory.to_f64().unwrap_or(0.0) * gamma * sigma_sq * t_horizon;
-    let risk_adjustment = Decimal::from_f64(risk_adjustment_f64).unwrap_or(Decimal::ZERO);
+    let risk_adjustment = if risk_adjustment_f64.is_finite() {
+        Decimal::from_f64(risk_adjustment_f64).unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+    
     let mut reservation_price = mid_price - risk_adjustment;
 
     if reservation_price <= Decimal::ZERO {
         reservation_price = mid_price;
     }
 
-    let half_spread = spread / Decimal::from(2);
+    // Calculate bid and ask prices
+    let half_spread = spread / Decimal::TWO;
     let raw_bid = reservation_price - half_spread;
     let raw_ask = reservation_price + half_spread;
 
@@ -131,8 +161,9 @@ pub fn compute_optimal_quote(
         raw_ask
     };
 
+    // Ensure bid <= ask
     if bid_price > ask_price {
-        let mid = (bid_price + ask_price) / Decimal::from(2);
+        let mid = (bid_price + ask_price) / Decimal::TWO;
         bid_price = mid;
         ask_price = mid;
     }
@@ -167,5 +198,34 @@ mod tests {
         let quote = compute_optimal_quote(0, mid, q, 0.01, 10.0, &config);
         assert!(quote.bid_price < quote.ask_price);
         assert!(quote.optimal_spread > Decimal::ZERO);
+    }
+
+    #[test]
+    fn compute_quote_with_inventory() {
+        let config = ASConfig::default();
+        let mid = Decimal::from_str("100.0").unwrap();
+        let inv = Decimal::from_str("5.0").unwrap();
+        let quote = compute_optimal_quote(0, mid, inv, 0.01, 10.0, &config);
+        // With positive inventory, reservation price should be below mid
+        assert!(quote.reservation_price <= mid);
+    }
+
+    #[test]
+    fn compute_quote_zero_volatility() {
+        let config = ASConfig::default();
+        let mid = Decimal::from_str("100.0").unwrap();
+        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.0, 10.0, &config);
+        // Should still produce valid quotes even with zero volatility
+        assert!(quote.bid_price <= quote.ask_price);
+    }
+
+    #[test]
+    fn compute_quote_extreme_gamma() {
+        let mut config = ASConfig::default();
+        config.gamma_max = 1e10; // Very high gamma max
+        let mid = Decimal::from_str("100.0").unwrap();
+        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.01, 10.0, &config);
+        // Should still produce valid quotes due to internal clamping
+        assert!(quote.gamma <= MAX_GAMMA_LIMIT);
     }
 }

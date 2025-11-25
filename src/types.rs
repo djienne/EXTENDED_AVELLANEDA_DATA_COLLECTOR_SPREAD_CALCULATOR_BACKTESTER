@@ -171,7 +171,9 @@ impl FundingRateInfo {
 
     pub fn format_timestamp(&self) -> String {
         use chrono::{DateTime, Utc};
-        let dt = DateTime::<Utc>::from_timestamp(self.timestamp as i64 / 1000, 0);
+        // Divide first to avoid overflow when casting
+        let seconds = (self.timestamp / 1000) as i64;
+        let dt = DateTime::<Utc>::from_timestamp(seconds, 0);
         match dt {
             Some(d) => d.format("%Y-%m-%d %H:%M UTC").to_string(),
             None => "N/A".to_string(),
@@ -199,7 +201,6 @@ impl FundingRateInfo {
     }
 
     /// Get the reference funding rate (current rate for Extended)
-    /// This is the rate that will be used for comparison
     pub fn reference_rate(&self) -> f64 {
         self.rate_percentage
     }
@@ -321,51 +322,44 @@ pub struct FeeInfo {
 }
 
 impl FeeInfo {
+    /// Default taker fee rate
+    const DEFAULT_TAKER_FEE: &'static str = "0.0006";
+    /// Default maker fee rate
+    const DEFAULT_MAKER_FEE: &'static str = "0.0002";
+
+    /// Extract fee string from a serde_json::Value
+    fn extract_fee_str(val: &serde_json::Value, default: &str) -> String {
+        match val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Object(obj) => {
+                if let Some(v) = obj.get("value") {
+                    match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        serde_json::Value::Number(n) => n.to_string(),
+                        _ => default.to_string(),
+                    }
+                } else {
+                    default.to_string()
+                }
+            }
+            _ => default.to_string(),
+        }
+    }
+
     /// Get taker fee as string
     pub fn taker_fee_str(&self) -> String {
-        // Handle both string and number formats
         match &self.taker_fee_rate {
-            Some(val) => match val {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Object(obj) => {
-                    // If it's an object, try to extract value field
-                    if let Some(v) = obj.get("value") {
-                        match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            _ => "0.0006".to_string(), // default
-                        }
-                    } else {
-                        "0.0006".to_string() // default
-                    }
-                }
-                _ => "0.0006".to_string(), // default
-            },
-            None => "0.0006".to_string(), // default if field not present
+            Some(val) => Self::extract_fee_str(val, Self::DEFAULT_TAKER_FEE),
+            None => Self::DEFAULT_TAKER_FEE.to_string(),
         }
     }
 
     /// Get maker fee as string
     pub fn maker_fee_str(&self) -> String {
         match &self.maker_fee_rate {
-            Some(val) => match val {
-                serde_json::Value::String(s) => s.clone(),
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::Object(obj) => {
-                    if let Some(v) = obj.get("value") {
-                        match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            _ => "0.0002".to_string(), // default
-                        }
-                    } else {
-                        "0.0002".to_string() // default
-                    }
-                }
-                _ => "0.0002".to_string(), // default
-            },
-            None => "0.0002".to_string(), // default if field not present
+            Some(val) => Self::extract_fee_str(val, Self::DEFAULT_MAKER_FEE),
+            None => Self::DEFAULT_MAKER_FEE.to_string(),
         }
     }
 }
@@ -393,7 +387,7 @@ pub struct TradingConfig {
     #[serde(rename = "minOrderSizeChange")]
     pub min_order_size_change: String,  // Precision/increment for order sizes
     #[serde(rename = "minPriceChange")]
-    pub min_price_change: String,  // Minimum price increment (e.g., "0.01" for 2 decimals, "1" for whole numbers)
+    pub min_price_change: String,  // Minimum price increment
 }
 
 impl TradingConfig {
@@ -455,39 +449,38 @@ impl Position {
     }
 
     /// Get position size as float (always positive)
-    pub fn size_f64(&self) -> f64 {
-        self.size.parse().unwrap_or(0.0)
+    /// Returns None if parsing fails
+    pub fn size_f64(&self) -> Option<f64> {
+        self.size.parse().ok()
+    }
+
+    /// Get position size as float with default (always positive)
+    pub fn size_f64_or(&self, default: f64) -> f64 {
+        self.size.parse().unwrap_or(default)
     }
 
     /// Get signed position size (positive for LONG, negative for SHORT)
-    /// This is useful for ping pong mode initialization and position tracking
-    pub fn signed_size_f64(&self) -> f64 {
-        let size = self.size_f64();
-        match self.side {
+    pub fn signed_size_f64(&self) -> Option<f64> {
+        let size = self.size_f64()?;
+        Some(match self.side {
             PositionSide::Long => size,
             PositionSide::Short => -size,
-        }
+        })
     }
 
     /// Get position value as float
-    pub fn value_f64(&self) -> f64 {
-        self.value.parse().unwrap_or(0.0)
+    pub fn value_f64(&self) -> Option<f64> {
+        self.value.parse().ok()
     }
 
     /// Get entry price as float
-    pub fn entry_f64(&self) -> f64 {
-        self.entry_price
-            .as_ref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
+    pub fn entry_f64(&self) -> Option<f64> {
+        self.entry_price.as_ref().and_then(|s| s.parse().ok())
     }
 
     /// Get unrealized PnL as float
-    pub fn pnl_f64(&self) -> f64 {
-        self.unrealized_pnl
-            .as_ref()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.0)
+    pub fn pnl_f64(&self) -> Option<f64> {
+        self.unrealized_pnl.as_ref().and_then(|s| s.parse().ok())
     }
 }
 
@@ -533,38 +526,38 @@ pub struct Balance {
 
 impl Balance {
     /// Get balance as f64
-    pub fn balance_f64(&self) -> f64 {
-        self.balance.parse().unwrap_or(0.0)
+    pub fn balance_f64(&self) -> Option<f64> {
+        self.balance.parse().ok()
     }
 
     /// Get equity as f64
-    pub fn equity_f64(&self) -> f64 {
-        self.equity.parse().unwrap_or(0.0)
+    pub fn equity_f64(&self) -> Option<f64> {
+        self.equity.parse().ok()
     }
 
     /// Get available for trade as f64 (available capital)
-    pub fn available_for_trade_f64(&self) -> f64 {
-        self.available_for_trade.parse().unwrap_or(0.0)
+    pub fn available_for_trade_f64(&self) -> Option<f64> {
+        self.available_for_trade.parse().ok()
     }
 
     /// Get available for withdrawal as f64
-    pub fn available_for_withdrawal_f64(&self) -> f64 {
-        self.available_for_withdrawal.parse().unwrap_or(0.0)
+    pub fn available_for_withdrawal_f64(&self) -> Option<f64> {
+        self.available_for_withdrawal.parse().ok()
     }
 
     /// Get unrealised PnL as f64
-    pub fn unrealised_pnl_f64(&self) -> f64 {
-        self.unrealised_pnl.parse().unwrap_or(0.0)
+    pub fn unrealised_pnl_f64(&self) -> Option<f64> {
+        self.unrealised_pnl.parse().ok()
     }
 
     /// Get initial margin as f64
-    pub fn initial_margin_f64(&self) -> f64 {
-        self.initial_margin.parse().unwrap_or(0.0)
+    pub fn initial_margin_f64(&self) -> Option<f64> {
+        self.initial_margin.parse().ok()
     }
 
     /// Get margin ratio as f64
-    pub fn margin_ratio_f64(&self) -> f64 {
-        self.margin_ratio.parse().unwrap_or(0.0)
+    pub fn margin_ratio_f64(&self) -> Option<f64> {
+        self.margin_ratio.parse().ok()
     }
 }
 
@@ -615,28 +608,29 @@ pub struct Trade {
 
 impl Trade {
     /// Get price as f64
-    pub fn price_f64(&self) -> f64 {
-        self.price.parse().unwrap_or(0.0)
+    pub fn price_f64(&self) -> Option<f64> {
+        self.price.parse().ok()
     }
 
     /// Get quantity as f64
-    pub fn qty_f64(&self) -> f64 {
-        self.qty.parse().unwrap_or(0.0)
+    pub fn qty_f64(&self) -> Option<f64> {
+        self.qty.parse().ok()
     }
 
     /// Get value as f64
-    pub fn value_f64(&self) -> f64 {
-        self.value.parse().unwrap_or(0.0)
+    pub fn value_f64(&self) -> Option<f64> {
+        self.value.parse().ok()
     }
 
     /// Get fee as f64
-    pub fn fee_f64(&self) -> f64 {
-        self.fee.parse().unwrap_or(0.0)
+    pub fn fee_f64(&self) -> Option<f64> {
+        self.fee.parse().ok()
     }
 
     /// Format timestamp as human-readable string with millisecond precision
     pub fn format_time(&self) -> String {
         use chrono::{DateTime, Utc};
+        // Divide first to avoid overflow when casting
         let seconds = (self.created_time / 1000) as i64;
         let nanos = ((self.created_time % 1000) * 1_000_000) as u32;
 
@@ -689,18 +683,19 @@ pub struct PublicTrade {
 
 impl PublicTrade {
     /// Get price as f64
-    pub fn price_f64(&self) -> f64 {
-        self.p.parse().unwrap_or(0.0)
+    pub fn price_f64(&self) -> Option<f64> {
+        self.p.parse().ok()
     }
 
     /// Get quantity as f64
-    pub fn qty_f64(&self) -> f64 {
-        self.q.parse().unwrap_or(0.0)
+    pub fn qty_f64(&self) -> Option<f64> {
+        self.q.parse().ok()
     }
 
     /// Format timestamp as human-readable string with millisecond precision
     pub fn format_time(&self) -> String {
         use chrono::{DateTime, Utc};
+        // Divide first to avoid overflow when casting
         let seconds = (self.t / 1000) as i64;
         let nanos = ((self.t % 1000) * 1_000_000) as u32;
 
@@ -879,20 +874,28 @@ impl FullOrderbookSnapshot {
         let bids: Vec<DepthLevel> = msg.data.b.iter()
             .take(max_levels)
             .enumerate()
-            .map(|(i, level)| DepthLevel {
-                level: i,
-                price: level.p.parse().unwrap_or(0.0),
-                quantity: level.q.parse().unwrap_or(0.0),
+            .filter_map(|(i, level)| {
+                let price = level.p.parse().ok()?;
+                let quantity = level.q.parse().ok()?;
+                Some(DepthLevel {
+                    level: i,
+                    price,
+                    quantity,
+                })
             })
             .collect();
 
         let asks: Vec<DepthLevel> = msg.data.a.iter()
             .take(max_levels)
             .enumerate()
-            .map(|(i, level)| DepthLevel {
-                level: i,
-                price: level.p.parse().unwrap_or(0.0),
-                quantity: level.q.parse().unwrap_or(0.0),
+            .filter_map(|(i, level)| {
+                let price = level.p.parse().ok()?;
+                let quantity = level.q.parse().ok()?;
+                Some(DepthLevel {
+                    level: i,
+                    price,
+                    quantity,
+                })
             })
             .collect();
 
@@ -923,11 +926,71 @@ impl FullOrderbookSnapshot {
     pub fn spread_bps(&self) -> Option<f64> {
         let mid = self.mid_price()?;
         let spread = self.spread()?;
-        Some((spread / mid) * 10000.0)
+        if mid > 0.0 {
+            Some((spread / mid) * 10000.0)
+        } else {
+            None
+        }
     }
 
     /// Get timestamp in seconds
     pub fn timestamp_sec(&self) -> f64 {
         self.timestamp_ms as f64 / 1000.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_position_parsing() {
+        let pos = Position {
+            market: "BTC-USD".to_string(),
+            side: PositionSide::Long,
+            size: "1.5".to_string(),
+            value: "45000".to_string(),
+            entry_price: Some("30000".to_string()),
+            unrealized_pnl: Some("100".to_string()),
+        };
+
+        assert!(pos.is_long());
+        assert!(!pos.is_short());
+        assert_eq!(pos.size_f64(), Some(1.5));
+        assert_eq!(pos.signed_size_f64(), Some(1.5));
+        assert_eq!(pos.entry_f64(), Some(30000.0));
+    }
+
+    #[test]
+    fn test_balance_parsing() {
+        let balance = Balance {
+            collateral_name: "USD".to_string(),
+            balance: "10000".to_string(),
+            equity: "10500".to_string(),
+            available_for_trade: "8000".to_string(),
+            available_for_withdrawal: "7000".to_string(),
+            unrealised_pnl: "500".to_string(),
+            initial_margin: "2000".to_string(),
+            margin_ratio: "0.2".to_string(),
+            updated_time: 1234567890000,
+        };
+
+        assert_eq!(balance.balance_f64(), Some(10000.0));
+        assert_eq!(balance.equity_f64(), Some(10500.0));
+    }
+
+    #[test]
+    fn test_invalid_parse_returns_none() {
+        let pos = Position {
+            market: "BTC-USD".to_string(),
+            side: PositionSide::Long,
+            size: "invalid".to_string(),
+            value: "also_invalid".to_string(),
+            entry_price: None,
+            unrealized_pnl: None,
+        };
+
+        assert_eq!(pos.size_f64(), None);
+        assert_eq!(pos.value_f64(), None);
     }
 }

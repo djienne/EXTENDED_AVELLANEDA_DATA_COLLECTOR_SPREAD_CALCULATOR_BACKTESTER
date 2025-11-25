@@ -1,7 +1,6 @@
 use crate::data_loader::OrderbookSnapshot;
 use crate::model_types::EffectiveQuote;
 use rust_decimal::Decimal;
-// use rust_decimal::prelude::*;
 
 pub fn calculate_effective_price(
     snapshot: &OrderbookSnapshot,
@@ -10,7 +9,12 @@ pub fn calculate_effective_price(
     let (effective_bid, weighted_bid) = calculate_side_effective_price(&snapshot.bids, volume_threshold)?;
     let (effective_ask, weighted_ask) = calculate_side_effective_price(&snapshot.asks, volume_threshold)?;
 
-    let mid = (effective_bid + effective_ask) / Decimal::from(2);
+    // Guard against zero prices
+    if effective_bid.is_zero() || effective_ask.is_zero() {
+        return None;
+    }
+
+    let mid = (effective_bid + effective_ask) / Decimal::TWO;
 
     Some(EffectiveQuote {
         bid: effective_bid,
@@ -25,6 +29,10 @@ fn calculate_side_effective_price(
     levels: &[(Decimal, Decimal)], // (price, qty)
     threshold: Decimal,
 ) -> Option<(Decimal, Decimal)> {
+    if levels.is_empty() || threshold <= Decimal::ZERO {
+        return None;
+    }
+
     let mut accumulated_value = Decimal::ZERO;
     let mut accumulated_qty = Decimal::ZERO;
     let mut weighted_price_sum = Decimal::ZERO;
@@ -40,6 +48,11 @@ fn calculate_side_effective_price(
     let mut final_price = Decimal::ZERO;
 
     for (price, qty) in levels {
+        // Skip invalid levels
+        if *price <= Decimal::ZERO || *qty <= Decimal::ZERO {
+            continue;
+        }
+
         let value = price * qty;
         
         // If this level fills the remaining threshold
@@ -66,12 +79,16 @@ fn calculate_side_effective_price(
         }
     }
 
+    // Must have accumulated some quantity to calculate VWAP
+    if accumulated_qty.is_zero() {
+        return None;
+    }
+
+    // Check if we reached the threshold (optional: could return partial results)
     if accumulated_value < threshold {
         // Not enough depth to reach threshold
-        // We can either return None or return what we have.
-        // Let's return what we have if it's > 0, but warn?
-        // For now, if we have 0 volume, return None.
-        if accumulated_qty.is_zero() {
+        // Return what we have if we have something meaningful
+        if final_price.is_zero() {
             return None;
         }
     }
@@ -86,4 +103,42 @@ fn calculate_side_effective_price(
     // Usually this means the VWAP of that depth.
     
     Some((final_price, vwap))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_empty_levels() {
+        let result = calculate_side_effective_price(&[], Decimal::from(1000));
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_zero_threshold() {
+        let levels = vec![(Decimal::from(100), Decimal::from(10))];
+        let result = calculate_side_effective_price(&levels, Decimal::ZERO);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_single_level_sufficient() {
+        let levels = vec![(Decimal::from(100), Decimal::from(20))]; // 2000 value
+        let result = calculate_side_effective_price(&levels, Decimal::from(1000));
+        assert!(result.is_some());
+        let (final_price, vwap) = result.unwrap();
+        assert_eq!(final_price, Decimal::from(100));
+        assert_eq!(vwap, Decimal::from(100));
+    }
+
+    #[test]
+    fn test_multiple_levels() {
+        let levels = vec![
+            (Decimal::from(100), Decimal::from(5)),  // 500 value
+            (Decimal::from(99), Decimal::from(10)),  // 990 value
+        ];
+        let result = calculate_side_effective_price(&levels, Decimal::from(1000));
+        assert!(result.is_some());
+    }
 }
