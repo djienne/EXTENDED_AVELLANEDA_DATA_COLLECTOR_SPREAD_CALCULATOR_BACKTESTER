@@ -31,6 +31,8 @@ target/
 *.swo
 *~
 .DS_Store
+.claude/settings.local.json
+.claude/settings.local.json
 
 # Data collection output
 data/*/trades.csv
@@ -53,6 +55,11 @@ data/*/orderbook_parts/*.parquet
 # Exclude large CSV and result files
 data/*/as_results.csv
 data/*/backtest_results.csv
+data/*/gaps.csv
+data/*/grid_search_2d_results.csv
+
+# Test compression artifacts
+test_compression/
 
 # Log files
 *.log
