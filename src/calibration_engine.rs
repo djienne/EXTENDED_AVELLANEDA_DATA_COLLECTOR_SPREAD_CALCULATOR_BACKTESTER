@@ -18,10 +18,14 @@ pub struct CalibrationResult {
     pub timestamp: u64,
     /// Volatility (sigma) as percentage (e.g., 0.02 = 2%)
     pub volatility: f64,
-    /// Intensity parameter kappa
-    pub kappa: f64,
-    /// Intensity parameter A
-    pub a: f64,
+    /// Intensity parameter kappa for bid side
+    pub bid_kappa: f64,
+    /// Intensity parameter A for bid side
+    pub bid_a: f64,
+    /// Intensity parameter kappa for ask side
+    pub ask_kappa: f64,
+    /// Intensity parameter A for ask side
+    pub ask_a: f64,
 }
 
 /// Stateful calibration engine for AS model
@@ -32,10 +36,14 @@ pub struct CalibrationEngine {
     calibration_prices: Vec<(u64, Decimal)>,
     /// Rolling window of trades for intensity parameter fitting
     window_trades: Vec<TradeEvent>,
-    /// Current kappa parameter
-    kappa: f64,
-    /// Current A parameter
-    a: f64,
+    /// Current kappa parameter for bid side
+    bid_kappa: f64,
+    /// Current A parameter for bid side
+    bid_a: f64,
+    /// Current kappa parameter for ask side
+    ask_kappa: f64,
+    /// Current A parameter for ask side
+    ask_a: f64,
     /// Timestamp of last calibration
     last_calibration_ts: Option<u64>,
     /// Calibration window size in milliseconds
@@ -58,8 +66,10 @@ impl CalibrationEngine {
         Self {
             calibration_prices: Vec::with_capacity(estimated_prices),
             window_trades: Vec::with_capacity(estimated_trades),
-            kappa: 10.0,  // Default starting value
-            a: 100.0,     // Default starting value
+            bid_kappa: 10.0,  // Default starting value
+            bid_a: 100.0,     // Default starting value
+            ask_kappa: 10.0,  // Default starting value
+            ask_a: 100.0,     // Default starting value
             last_calibration_ts: None,
             calibration_window_ms,
             recalibration_interval_ms,
@@ -133,8 +143,8 @@ impl CalibrationEngine {
         // Calculate volatility
         let volatility = calculate_volatility(&prices, actual_duration_sec);
 
-        // Fit intensity parameters
-        let (new_kappa, new_a) = fit_intensity_parameters(
+        // Fit intensity parameters (returns separate bid/ask values)
+        let (new_bid_kappa, new_bid_a, new_ask_kappa, new_ask_a) = fit_intensity_parameters(
             &self.window_trades,
             &self.calibration_prices,
             actual_duration_sec,
@@ -142,9 +152,13 @@ impl CalibrationEngine {
         );
 
         // Update stored parameters if valid
-        if new_kappa > 0.0 && new_a > 0.0 {
-            self.kappa = new_kappa;
-            self.a = new_a;
+        if new_bid_kappa > 0.0 && new_bid_a > 0.0 {
+            self.bid_kappa = new_bid_kappa;
+            self.bid_a = new_bid_a;
+        }
+        if new_ask_kappa > 0.0 && new_ask_a > 0.0 {
+            self.ask_kappa = new_ask_kappa;
+            self.ask_a = new_ask_a;
         }
 
         // Update last calibration timestamp
@@ -153,21 +167,35 @@ impl CalibrationEngine {
         Some(CalibrationResult {
             timestamp: current_ts,
             volatility,
-            kappa: self.kappa,
-            a: self.a,
+            bid_kappa: self.bid_kappa,
+            bid_a: self.bid_a,
+            ask_kappa: self.ask_kappa,
+            ask_a: self.ask_a,
         })
     }
 
-    /// Get current kappa parameter
+    /// Get current bid kappa parameter
     #[inline]
-    pub fn kappa(&self) -> f64 {
-        self.kappa
+    pub fn bid_kappa(&self) -> f64 {
+        self.bid_kappa
     }
 
-    /// Get current A parameter
+    /// Get current bid A parameter
     #[inline]
-    pub fn a(&self) -> f64 {
-        self.a
+    pub fn bid_a(&self) -> f64 {
+        self.bid_a
+    }
+
+    /// Get current ask kappa parameter
+    #[inline]
+    pub fn ask_kappa(&self) -> f64 {
+        self.ask_kappa
+    }
+
+    /// Get current ask A parameter
+    #[inline]
+    pub fn ask_a(&self) -> f64 {
+        self.ask_a
     }
 
     /// Get last calibration timestamp
@@ -192,8 +220,10 @@ impl CalibrationEngine {
     pub fn reset(&mut self) {
         self.calibration_prices.clear();
         self.window_trades.clear();
-        self.kappa = 10.0;
-        self.a = 100.0;
+        self.bid_kappa = 10.0;
+        self.bid_a = 100.0;
+        self.ask_kappa = 10.0;
+        self.ask_a = 100.0;
         self.last_calibration_ts = None;
     }
 }

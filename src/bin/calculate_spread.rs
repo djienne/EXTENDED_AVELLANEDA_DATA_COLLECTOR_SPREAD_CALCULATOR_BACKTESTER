@@ -4,6 +4,7 @@ use extended_data_collector::metrics::calculate_effective_price;
 use extended_data_collector::calibration_engine::CalibrationEngine;
 use extended_data_collector::spread_model::compute_optimal_quote;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
 use std::path::Path;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -103,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Prepare Output with buffered writer
     let file = File::create(&output_path)?;
     let mut output_file = BufWriter::new(file);
-    writeln!(output_file, "timestamp,datetime,mid_price,volatility,kappa,A,gamma,optimal_spread_bps,bid_spread_bps,ask_spread_bps,bid_price,ask_price,reservation_price")?;
+    writeln!(output_file, "timestamp,datetime,mid_price,volatility,bid_kappa,ask_kappa,bid_a,ask_a,gamma,optimal_spread_bps,bid_spread_bps,ask_spread_bps,bid_price,ask_price,reservation_price")?;
 
     // Print Header to Terminal
     println!("{:-<155}", "");
@@ -157,7 +158,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         quote.mid,
                         Decimal::ZERO,
                         cal_result.volatility,
-                        cal_result.kappa,
+                        cal_result.bid_kappa,
+                        cal_result.ask_kappa,
                         &config,
                     );
 
@@ -179,21 +181,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             bid_spread_bps.to_f64().unwrap_or(0.0),
                             ask_spread_bps.to_f64().unwrap_or(0.0),
                             cal_result.volatility,
-                            cal_result.kappa,
-                            cal_result.a,
+                            cal_result.bid_kappa,
+                            cal_result.ask_kappa,
+                            cal_result.bid_a,
+                            cal_result.ask_a,
                             optimal.gamma,
                         );
 
                         // Output to CSV
                         writeln!(
                             output_file,
-                            "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                            "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
                             current_ts,
                             format_timestamp(current_ts),
                             quote.mid,
                             cal_result.volatility,
-                            cal_result.kappa,
-                            cal_result.a,
+                            cal_result.bid_kappa,
+                            cal_result.ask_kappa,
+                            cal_result.bid_a,
+                            cal_result.ask_a,
                             optimal.gamma,
                             total_spread_bps,
                             bid_spread_bps,
@@ -205,9 +211,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // Output to terminal
                         println!(
-                            "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
-                            current_ts, quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
-                            optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
+                            "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
+                            current_ts, quote.mid, cal_result.volatility, cal_result.bid_kappa, cal_result.ask_kappa,
+                            cal_result.bid_a, cal_result.ask_a, optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
                         );
                     }
                 }
@@ -223,7 +229,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 quote.mid,
                 Decimal::ZERO,
                 cal_result.volatility,
-                cal_result.kappa,
+                cal_result.bid_kappa,
+                cal_result.ask_kappa,
                 &config,
             );
 
@@ -243,20 +250,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bid_spread_bps.to_f64().unwrap_or(0.0),
                     ask_spread_bps.to_f64().unwrap_or(0.0),
                     cal_result.volatility,
-                    cal_result.kappa,
-                    cal_result.a,
+                    cal_result.bid_kappa,
+                    cal_result.ask_kappa,
+                    cal_result.bid_a,
+                    cal_result.ask_a,
                     optimal.gamma,
                 );
 
                 writeln!(
                     output_file,
-                    "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+                    "{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
                     last_ts,
                     format_timestamp(last_ts),
                     quote.mid,
                     cal_result.volatility,
-                    cal_result.kappa,
-                    cal_result.a,
+                    cal_result.bid_kappa,
+                    cal_result.ask_kappa,
+                    cal_result.bid_a,
+                    cal_result.ask_a,
                     optimal.gamma,
                     total_spread_bps,
                     bid_spread_bps,
@@ -267,9 +278,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
 
                 println!(
-                    "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
-                    last_ts, quote.mid, cal_result.volatility, cal_result.kappa, cal_result.a,
-                    optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
+                    "{:<15} | {:>12.2} | {:>10.6} | {:>8.2} | {:>8.2} | {:>8.2} | {:>8.2} | {:>6.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2} | {:>12.2}",
+                    last_ts, quote.mid, cal_result.volatility, cal_result.bid_kappa, cal_result.ask_kappa,
+                    cal_result.bid_a, cal_result.ask_a, optimal.gamma, total_spread_bps, bid_spread_bps, ask_spread_bps, bid_price, ask_price
                 );
             }
         }
@@ -305,8 +316,10 @@ struct SpreadStats {
     bid_spread_bps: Vec<f64>,
     ask_spread_bps: Vec<f64>,
     volatility: Vec<f64>,
-    kappa: Vec<f64>,
-    a: Vec<f64>,
+    bid_kappa: Vec<f64>,
+    ask_kappa: Vec<f64>,
+    bid_a: Vec<f64>,
+    ask_a: Vec<f64>,
     gamma: Vec<f64>,
 }
 
@@ -317,8 +330,10 @@ impl SpreadStats {
             bid_spread_bps: Vec::new(),
             ask_spread_bps: Vec::new(),
             volatility: Vec::new(),
-            kappa: Vec::new(),
-            a: Vec::new(),
+            bid_kappa: Vec::new(),
+            ask_kappa: Vec::new(),
+            bid_a: Vec::new(),
+            ask_a: Vec::new(),
             gamma: Vec::new(),
         }
     }
@@ -329,16 +344,20 @@ impl SpreadStats {
         bid_spread: f64,
         ask_spread: f64,
         vol: f64,
-        kappa: f64,
-        a: f64,
+        bid_kappa: f64,
+        ask_kappa: f64,
+        bid_a: f64,
+        ask_a: f64,
         gamma: f64,
     ) {
         self.total_spread_bps.push(total_spread);
         self.bid_spread_bps.push(bid_spread);
         self.ask_spread_bps.push(ask_spread);
         self.volatility.push(vol);
-        self.kappa.push(kappa);
-        self.a.push(a);
+        self.bid_kappa.push(bid_kappa);
+        self.ask_kappa.push(ask_kappa);
+        self.bid_a.push(bid_a);
+        self.ask_a.push(ask_a);
         self.gamma.push(gamma);
     }
 
@@ -362,8 +381,10 @@ impl SpreadStats {
         Self::print_stats_row("Bid Spread (bps)", &self.bid_spread_bps);
         Self::print_stats_row("Ask Spread (bps)", &self.ask_spread_bps);
         Self::print_stats_row("Volatility", &self.volatility);
-        Self::print_stats_row("Kappa", &self.kappa);
-        Self::print_stats_row("A Parameter", &self.a);
+        Self::print_stats_row("Bid Kappa", &self.bid_kappa);
+        Self::print_stats_row("Ask Kappa", &self.ask_kappa);
+        Self::print_stats_row("Bid A Parameter", &self.bid_a);
+        Self::print_stats_row("Ask A Parameter", &self.ask_a);
         Self::print_stats_row("Gamma", &self.gamma);
 
         println!("{:=<80}", "");

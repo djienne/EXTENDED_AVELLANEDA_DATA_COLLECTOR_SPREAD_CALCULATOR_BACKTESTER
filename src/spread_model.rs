@@ -46,7 +46,8 @@ pub fn compute_optimal_quote(
     mid_price: Decimal,
     inventory: Decimal,
     sigma_pct_raw: f64,
-    kappa: f64,
+    bid_kappa: f64,
+    ask_kappa: f64,
     config: &ASConfig,
 ) -> OptimalQuote {
     let sigma_pct = clamp_sigma(sigma_pct_raw, config);
@@ -90,29 +91,35 @@ pub fn compute_optimal_quote(
         gamma = gamma.clamp(min_g, max_g);
     }
 
-    let kappa_eff = if kappa > 0.0 { kappa } else { 10.0 };
-    let term = 1.0 + (gamma / kappa_eff);
-    
-    // Ensure term is positive for ln()
-    let term_safe = term.max(MIN_GAMMA);
-
+    // Calculate separate bid and ask spreads using side-specific kappa values
     let vol_risk_term = gamma * sigma_sq * t_horizon;
-    let optimal_spread_f64 = vol_risk_term + (2.0 / gamma) * term_safe.ln();
-    
-    // Validate the computed spread
-    let mut spread = if optimal_spread_f64.is_finite() && optimal_spread_f64 > 0.0 {
-        Decimal::from_f64(optimal_spread_f64).unwrap_or(Decimal::ZERO)
+
+    // Bid spread calculation
+    let bid_kappa_eff = if bid_kappa > 0.0 { bid_kappa } else { 10.0 };
+    let bid_term = (1.0 + (gamma / bid_kappa_eff)).max(MIN_GAMMA);
+    let bid_spread_f64 = vol_risk_term + (2.0 / gamma) * bid_term.ln();
+
+    // Ask spread calculation
+    let ask_kappa_eff = if ask_kappa > 0.0 { ask_kappa } else { 10.0 };
+    let ask_term = (1.0 + (gamma / ask_kappa_eff)).max(MIN_GAMMA);
+    let ask_spread_f64 = vol_risk_term + (2.0 / gamma) * ask_term.ln();
+
+    // Convert to Decimal and validate
+    let mut bid_spread = if bid_spread_f64.is_finite() && bid_spread_f64 > 0.0 {
+        Decimal::from_f64(bid_spread_f64).unwrap_or(Decimal::ZERO)
     } else {
         Decimal::ZERO
     };
-    
-    if spread <= Decimal::ZERO || mid_price <= Decimal::ZERO {
-        spread = Decimal::ZERO;
-    }
 
-    // Apply spread bounds in basis points
-    if spread > Decimal::ZERO && mid_price > Decimal::ZERO {
-        let mut spread_bps = (spread / mid_price) * Decimal::from(10000);
+    let mut ask_spread = if ask_spread_f64.is_finite() && ask_spread_f64 > 0.0 {
+        Decimal::from_f64(ask_spread_f64).unwrap_or(Decimal::ZERO)
+    } else {
+        Decimal::ZERO
+    };
+
+    // Apply spread bounds in basis points for bid spread
+    if bid_spread > Decimal::ZERO && mid_price > Decimal::ZERO {
+        let mut spread_bps = (bid_spread / mid_price) * Decimal::from(10000);
         let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
 
         let fee_floor_bps = config.maker_fee_bps.max(0.0);
@@ -126,7 +133,27 @@ pub fn compute_optimal_quote(
         if max_bps > 0.0 {
             let clamped_bps = spread_bps_f64.clamp(min_bps, max_bps);
             spread_bps = Decimal::from_f64(clamped_bps).unwrap_or(spread_bps);
-            spread = (spread_bps * mid_price) / Decimal::from(10000);
+            bid_spread = (spread_bps * mid_price) / Decimal::from(10000);
+        }
+    }
+
+    // Apply spread bounds in basis points for ask spread
+    if ask_spread > Decimal::ZERO && mid_price > Decimal::ZERO {
+        let mut spread_bps = (ask_spread / mid_price) * Decimal::from(10000);
+        let spread_bps_f64 = spread_bps.to_f64().unwrap_or(0.0);
+
+        let fee_floor_bps = config.maker_fee_bps.max(0.0);
+        let min_bps = config.min_spread_bps.max(2.0 * fee_floor_bps);
+        let max_bps = if config.max_spread_bps > 0.0 {
+            config.max_spread_bps
+        } else {
+            spread_bps_f64.max(min_bps)
+        };
+
+        if max_bps > 0.0 {
+            let clamped_bps = spread_bps_f64.clamp(min_bps, max_bps);
+            spread_bps = Decimal::from_f64(clamped_bps).unwrap_or(spread_bps);
+            ask_spread = (spread_bps * mid_price) / Decimal::from(10000);
         }
     }
 
@@ -144,10 +171,11 @@ pub fn compute_optimal_quote(
         reservation_price = mid_price;
     }
 
-    // Calculate bid and ask prices
-    let half_spread = spread / Decimal::TWO;
-    let raw_bid = reservation_price - half_spread;
-    let raw_ask = reservation_price + half_spread;
+    // Calculate bid and ask prices using side-specific spreads
+    let half_bid_spread = bid_spread / Decimal::TWO;
+    let half_ask_spread = ask_spread / Decimal::TWO;
+    let raw_bid = reservation_price - half_bid_spread;
+    let raw_ask = reservation_price + half_ask_spread;
 
     let tick = Decimal::from_f64(config.tick_size).unwrap_or(Decimal::ZERO);
     let mut bid_price = if raw_bid > Decimal::ZERO {
@@ -168,10 +196,12 @@ pub fn compute_optimal_quote(
         ask_price = mid;
     }
 
+    // Final spread is the actual distance between bid and ask
     let final_spread = if ask_price > bid_price {
         ask_price - bid_price
     } else {
-        spread.max(Decimal::ZERO)
+        // If prices crossed, use average of theoretical spreads
+        ((bid_spread + ask_spread) / Decimal::TWO).max(Decimal::ZERO)
     };
 
     OptimalQuote {
@@ -195,7 +225,7 @@ mod tests {
         let config = ASConfig::default();
         let mid = Decimal::from_str("100.0").unwrap();
         let q = Decimal::ZERO;
-        let quote = compute_optimal_quote(0, mid, q, 0.01, 10.0, &config);
+        let quote = compute_optimal_quote(0, mid, q, 0.01, 10.0, 10.0, &config);
         assert!(quote.bid_price < quote.ask_price);
         assert!(quote.optimal_spread > Decimal::ZERO);
     }
@@ -205,7 +235,7 @@ mod tests {
         let config = ASConfig::default();
         let mid = Decimal::from_str("100.0").unwrap();
         let inv = Decimal::from_str("5.0").unwrap();
-        let quote = compute_optimal_quote(0, mid, inv, 0.01, 10.0, &config);
+        let quote = compute_optimal_quote(0, mid, inv, 0.01, 10.0, 10.0, &config);
         // With positive inventory, reservation price should be below mid
         assert!(quote.reservation_price <= mid);
     }
@@ -214,7 +244,7 @@ mod tests {
     fn compute_quote_zero_volatility() {
         let config = ASConfig::default();
         let mid = Decimal::from_str("100.0").unwrap();
-        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.0, 10.0, &config);
+        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.0, 10.0, 10.0, &config);
         // Should still produce valid quotes even with zero volatility
         assert!(quote.bid_price <= quote.ask_price);
     }
@@ -224,7 +254,7 @@ mod tests {
         let mut config = ASConfig::default();
         config.gamma_max = 1e10; // Very high gamma max
         let mid = Decimal::from_str("100.0").unwrap();
-        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.01, 10.0, &config);
+        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.01, 10.0, 10.0, &config);
         // Should still produce valid quotes due to internal clamping
         assert!(quote.gamma <= MAX_GAMMA_LIMIT);
     }

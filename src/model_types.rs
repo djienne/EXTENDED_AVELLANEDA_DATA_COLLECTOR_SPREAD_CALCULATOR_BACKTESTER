@@ -104,11 +104,14 @@ pub struct EffectiveQuote {
 pub struct ModelParams {
     /// Volatility (sigma)
     pub sigma: f64,
-    /// Order arrival intensity decay (kappa)
-    pub kappa: f64,
-    /// Base order arrival intensity (A)
-    /// Note: Using snake_case per Rust convention
-    pub a: f64,
+    /// Order arrival intensity decay (kappa) for bid side
+    pub bid_kappa: f64,
+    /// Base order arrival intensity (A) for bid side
+    pub bid_a: f64,
+    /// Order arrival intensity decay (kappa) for ask side
+    pub ask_kappa: f64,
+    /// Base order arrival intensity (A) for ask side
+    pub ask_a: f64,
     /// Risk aversion (gamma) from config
     pub gamma: f64,
 }

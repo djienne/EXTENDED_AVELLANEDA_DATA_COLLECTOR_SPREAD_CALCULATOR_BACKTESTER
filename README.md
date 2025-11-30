@@ -18,7 +18,8 @@ This project is designed to collect high-frequency market data from **Extended D
 *   **Event-Driven Engine**: Simulates fills sequentially between orderbook updates to eliminate look-ahead bias.
 *   **Realistic Constraints**: Enforces inventory limits, transaction costs (maker/taker fees), and cash balance.
 *   **Configurable Cooldowns**: Supports separate bid/ask fill cooldowns to prevent rapid-fire trading while allowing two-way flow.
-*   **Dynamic Calibration**: Continuously updates volatility ($\sigma$) and intensity parameters ($\kappa$, $A$) based on a rolling window.
+*   **Dynamic Calibration**: Continuously updates volatility ($\sigma$) and side-specific intensity parameters ($\kappa_{bid}$, $A_{bid}$, $\kappa_{ask}$, $A_{ask}$) based on a rolling window.
+*   **Asymmetric Spreads**: Calculates separate optimal spreads for bid and ask sides using their respective fill intensities, allowing for more accurate pricing when liquidity differs across sides.
 
 ### 3. Analysis Tools
 *   **Spread Calculation**: Computes optimal bid/ask spreads based on current inventory and market volatility.
@@ -31,7 +32,7 @@ This project is designed to collect high-frequency market data from **Extended D
 *   `config.json` configured (see below).
 
 **Important**: You must collect data for a sufficient period before running backtests or spread calculations. The system requires historical data to:
-- Calibrate volatility ($\sigma$) and intensity parameters ($\kappa$, $A$)
+- Calibrate volatility ($\sigma$) and side-specific intensity parameters ($\kappa_{bid}$, $A_{bid}$, $\kappa_{ask}$, $A_{ask}$)
 - Build a rolling window for dynamic parameter updates
 - Provide realistic market conditions for backtesting
 
@@ -140,14 +141,49 @@ To change compression level, see `COMPRESSION_UPGRADE.md`. Current options:
 - **GZIP(6)**: Maximum compatibility
 - **LZ4**: Maximum speed
 
+## Avellaneda-Stoikov Model Details
+
+### Asymmetric Spread Calculation
+
+The system uses **side-specific intensity parameters** to calculate optimal spreads independently for bid and ask sides:
+
+**Bid Spread Formula:**
+$$\delta_{bid} = \gamma\sigma^2T + \frac{2}{\gamma}\ln\left(1 + \frac{\gamma}{\kappa_{bid}}\right)$$
+
+**Ask Spread Formula:**
+$$\delta_{ask} = \gamma\sigma^2T + \frac{2}{\gamma}\ln\left(1 + \frac{\gamma}{\kappa_{ask}}\right)$$
+
+Where:
+- $\sigma$ = Volatility (estimated from price returns)
+- $\gamma$ = Risk aversion parameter
+- $T$ = Time horizon (inventory_horizon_seconds)
+- $\kappa_{bid}$ = Fill intensity for bid side (fitted from trades hitting bids)
+- $\kappa_{ask}$ = Fill intensity for ask side (fitted from trades hitting asks)
+
+**Quote Placement:**
+- Reservation price: $r = mid - \gamma\sigma^2T \cdot q$ (where $q$ is inventory)
+- Bid price: $r - \delta_{bid}/2$
+- Ask price: $r + \delta_{ask}/2$
+
+This approach captures asymmetries in market microstructure, where bid and ask liquidity may have different fill characteristics.
+
+### Intensity Parameter Calibration
+
+The system fits separate exponential decay models for each side:
+
+$$\lambda_{bid}(\delta) = A_{bid} \cdot e^{-\kappa_{bid} \cdot \delta}$$
+$$\lambda_{ask}(\delta) = A_{ask} \cdot e^{-\kappa_{ask} \cdot \delta}$$
+
+Where $\lambda$ is the arrival rate of market orders at distance $\delta$ from the mid price. These parameters are estimated from historical trade data using linear regression on log-transformed rates.
+
 ## Architecture
 
 ### Core Components
 - **WebSocket Client** (`websocket.rs`): Real-time market data streaming
 - **Parquet Writer** (`storage/parquet_writer.rs`): High-performance data persistence
 - **Data Loader** (`data_loader.rs`): Efficient historical data loading
-- **Calibration** (`calibration.rs`): Parameter estimation ($\sigma$, $\kappa$, $A$)
-- **Spread Model** (`spread_model.rs`): AS optimal quote calculation
+- **Calibration** (`calibration.rs`): Parameter estimation ($\sigma$, $\kappa_{bid}$, $A_{bid}$, $\kappa_{ask}$, $A_{ask}$)
+- **Spread Model** (`spread_model.rs`): AS optimal quote calculation with asymmetric spreads
 - **Backtest Engine** (`bin/backtest.rs`): Event-driven strategy simulation
 
 ### Key Binaries
