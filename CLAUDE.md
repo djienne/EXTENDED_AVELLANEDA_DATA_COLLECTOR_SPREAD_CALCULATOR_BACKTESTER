@@ -28,15 +28,15 @@ cargo run --bin verify_orderbook
 
 **Three-Phase System**:
 1. **Data Collection** (`collect_data`) - Stream and persist market data
-2. **Calibration** (`calibration.rs`) - Calculate volatility (σ) and intensity parameters (κ, A) from historical data
-3. **Backtesting** (`backtest`) - Simulate AS market-making strategy with realistic constraints
+2. **Calibration** (`calibration.rs`) - Calculate volatility (σ) and side-specific intensity parameters (κ_bid, A_bid, κ_ask, A_ask) from historical data
+3. **Backtesting** (`backtest`) - Simulate AS market-making strategy with realistic constraints and asymmetric spreads
 
 **Key Modules**:
 - `websocket.rs` - WebSocket client for streaming orderbooks and trades
 - `data_collector.rs` - CSV writers with deduplication and state persistence
 - `data_loader.rs` - Load historical CSV data for backtesting
-- `calibration.rs` - Volatility (σ) and intensity (κ, A) parameter estimation
-- `spread_model.rs` - AS optimal quote calculation with inventory skew
+- `calibration.rs` - Volatility (σ) and side-specific intensity (κ_bid, A_bid, κ_ask, A_ask) parameter estimation
+- `spread_model.rs` - AS optimal quote calculation with asymmetric spreads and inventory skew
 - `model_types.rs` - Configuration types for AS model (ASConfig, GammaMode, etc.)
 - `metrics.rs` - Performance tracking (PnL, Sharpe, fills, etc.)
 
@@ -73,13 +73,18 @@ data/{market}/
 ## Avellaneda-Stoikov Model
 
 **AS Quote Calculation** (`spread_model.rs:compute_optimal_quote`):
-- Computes optimal bid/ask spreads based on inventory risk and market volatility
-- Formula: `spread = γσ²T + (2/γ)ln(1 + γ/κ)`
+- Computes optimal bid/ask spreads based on inventory risk and market volatility with **asymmetric spreads**
+- **Bid Spread Formula**: `δ_bid = γσ²T + (2/γ)ln(1 + γ/κ_bid)`
+- **Ask Spread Formula**: `δ_ask = γσ²T + (2/γ)ln(1 + γ/κ_ask)`
   - `γ` (gamma): Risk aversion parameter (constant, inventory-scaled, or max-shift mode)
   - `σ` (sigma): Volatility (calculated from price returns)
-  - `κ` (kappa): Fill intensity parameter (fitted from trade arrival rates)
+  - `κ_bid` (bid kappa): Fill intensity for bid side (fitted from trades hitting bids)
+  - `κ_ask` (ask kappa): Fill intensity for ask side (fitted from trades hitting asks)
   - `T`: Time horizon (inventory_horizon_seconds)
 - Inventory skew: `reservation_price = mid - γσ²T·q` (q = current inventory)
+- Quote placement:
+  - `bid_price = reservation_price - δ_bid/2`
+  - `ask_price = reservation_price + δ_ask/2`
 - Enforces minimum spread (2× maker fee), maximum spread, and tick size rounding
 
 **Gamma Modes** (`model_types.rs:GammaMode`):
@@ -89,7 +94,10 @@ data/{market}/
 
 **Parameter Calibration** (`calibration.rs`):
 - `calculate_volatility`: Computes σ from log returns over rolling window
-- `fit_intensity_parameters`: Fits A and κ using exponential regression on trade arrival rates vs. price deltas
+- `fit_intensity_parameters`: Fits separate bid/ask parameters (A_bid, κ_bid, A_ask, κ_ask) using exponential regression on trade arrival rates vs. price deltas
+  - Bid trades: `λ_bid(δ) = A_bid · e^(-κ_bid·δ)` where δ is distance below mid
+  - Ask trades: `λ_ask(δ) = A_ask · e^(-κ_ask·δ)` where δ is distance above mid
+  - Returns 4 values: (bid_kappa, bid_a, ask_kappa, ask_a)
 
 ## Backtesting
 
@@ -98,7 +106,7 @@ data/{market}/
 - Enforces inventory limits, transaction costs (maker/taker fees), cash balance
 - Supports fill cooldowns (separate bid/ask to allow two-way flow)
 - Handles data gaps: warm-up period after gaps > gap_threshold_seconds
-- Dynamic recalibration: Updates σ, κ, A every recalibration_interval_seconds
+- Dynamic recalibration: Updates σ, κ_bid, A_bid, κ_ask, A_ask every recalibration_interval_seconds
 
 **Fill Logic**:
 - Quote valid for quote_validity_seconds after orderbook update

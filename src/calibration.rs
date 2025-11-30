@@ -192,15 +192,15 @@ fn find_mid_price_index(mid_prices: &[(u64, Decimal)], target_ts: u64, hint: usi
 /// * `tick_size` - The tick size for binning (e.g., 0.01)
 ///
 /// # Returns
-/// Tuple of (kappa, A) parameters
+/// Tuple of (bid_kappa, bid_a, ask_kappa, ask_a) parameters
 pub fn fit_intensity_parameters(
     trades: &[TradeEvent],
     mid_prices: &[(u64, Decimal)],
     window_duration_seconds: f64,
     tick_size: f64,
-) -> (f64, f64) {
+) -> (f64, f64, f64, f64) {
     if trades.is_empty() || mid_prices.is_empty() || window_duration_seconds <= 0.0 {
-        return (DEFAULT_KAPPA, DEFAULT_A);
+        return (DEFAULT_KAPPA, DEFAULT_A, DEFAULT_KAPPA, DEFAULT_A);
     }
 
     // Pre-allocate with reasonable estimates
@@ -242,20 +242,28 @@ pub fn fit_intensity_parameters(
         }
     }
 
-    // Fit both sides
+    // Fit both sides separately
     let bid_fit = regress_side(&bid_deltas, window_duration_seconds, tick_size);
     let ask_fit = regress_side(&ask_deltas, window_duration_seconds, tick_size);
 
-    // Combine results
+    // Return side-specific results (no averaging)
     match (bid_fit, ask_fit) {
         (Some((k_b, a_b)), Some((k_a, a_a))) => {
-            // Average both sides
-            let kappa = (k_b + k_a) / 2.0;
-            let a = (a_b + a_a) / 2.0;
-            (kappa, a)
+            // Both sides have valid fits - return separate values
+            (k_b, a_b, k_a, a_a)
         }
-        (Some((k, a)), None) | (None, Some((k, a))) => (k, a),
-        (None, None) => (DEFAULT_KAPPA, DEFAULT_A),
+        (Some((k_b, a_b)), None) => {
+            // Only bid side has valid fit - use bid for both sides
+            (k_b, a_b, k_b, a_b)
+        }
+        (None, Some((k_a, a_a))) => {
+            // Only ask side has valid fit - use ask for both sides
+            (k_a, a_a, k_a, a_a)
+        }
+        (None, None) => {
+            // Neither side has valid fit - use defaults
+            (DEFAULT_KAPPA, DEFAULT_A, DEFAULT_KAPPA, DEFAULT_A)
+        }
     }
 }
 
@@ -308,7 +316,7 @@ mod tests {
     #[test]
     fn test_fit_intensity_empty() {
         let result = fit_intensity_parameters(&[], &[], 100.0, 0.01);
-        assert_eq!(result, (DEFAULT_KAPPA, DEFAULT_A));
+        assert_eq!(result, (DEFAULT_KAPPA, DEFAULT_A, DEFAULT_KAPPA, DEFAULT_A));
     }
 
     #[test]

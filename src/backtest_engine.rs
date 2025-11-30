@@ -201,7 +201,7 @@ where
         let mut writer = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
         writeln!(
             writer,
-            "timestamp,datetime,mid_price,inventory,cash,pnl,spread_bps,bid_price,ask_price,bid_fills,ask_fills,gamma,kappa"
+            "timestamp,datetime,mid_price,inventory,cash,pnl,spread_bps,bid_price,ask_price,bid_fills,ask_fills,gamma,bid_kappa,ask_kappa,bid_a,ask_a"
         )?;
         Some(writer)
     } else {
@@ -359,7 +359,8 @@ where
                             mid_price,
                             state.inventory,
                             cal_result.volatility,
-                            cal_result.kappa,
+                            cal_result.bid_kappa,
+                            cal_result.ask_kappa,
                             &config,
                         );
 
@@ -385,7 +386,7 @@ where
                                 let inventory_display = state.inventory.round_dp(6);
                                 if let Err(e) = writeln!(
                                     writer,
-                                    "{},{},{},{},{},{},{:.2},{},{},{},{},{:.6},{:.2}",
+                                    "{},{},{},{},{},{},{:.2},{},{},{},{},{:.6},{:.2},{:.2},{:.2},{:.2}",
                                     current_ts,
                                     format_timestamp(current_ts),
                                     mid_price,
@@ -398,7 +399,10 @@ where
                                     state.bid_fills,
                                     state.ask_fills,
                                     optimal.gamma,
-                                    cal_result.kappa
+                                    cal_result.bid_kappa,
+                                    cal_result.ask_kappa,
+                                    cal_result.bid_a,
+                                    cal_result.ask_a
                                 ) {
                                     eprintln!("Warning: Failed to write to CSV: {}", e);
                                 }
