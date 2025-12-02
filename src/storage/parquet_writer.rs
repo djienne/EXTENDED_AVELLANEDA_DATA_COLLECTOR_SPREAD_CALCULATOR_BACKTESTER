@@ -1,14 +1,17 @@
-use crate::error::Result;
 use crate::data_collector::{CollectorState, OrderbookState};
-use crate::types::{WsOrderBookMessage, PublicTrade};
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampMillisecondArray, BooleanArray};
+use crate::error::Result;
+use crate::types::{PublicTrade, WsOrderBookMessage};
+use arrow::array::{
+    ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
+use parquet::file::metadata::KeyValue;
 use parquet::file::properties::WriterProperties;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -19,8 +22,47 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 const MAX_ROWS_PER_FILE: usize = 25_000; // Close file and start new one at 25K rows
+const MAX_TRADE_ROWS_PER_FILE: usize = 50_000; // Trades are lightweight; rotate less often to avoid tiny files
 const FLUSH_BATCH_SIZE: usize = 100; // Write batch every 100 rows
+const TRADE_FLUSH_BATCH_SIZE: usize = 10; // Flush trades every 10 rows
 const FLUSH_INTERVAL_SECS: u64 = 30; // Or write every 30 seconds
+
+/// Schema version for forward compatibility
+/// Increment this when making breaking schema changes
+const ORDERBOOK_SCHEMA_VERSION: &str = "1.0";
+const TRADES_SCHEMA_VERSION: &str = "1.0";
+
+/// Scan directory for existing parquet files and find the highest part number
+/// This ensures we don't overwrite existing files after restart
+fn scan_max_part_number(parts_dir: &Path, pattern_prefix: &str) -> usize {
+    let mut max_part = 0;
+
+    if let Ok(entries) = fs::read_dir(parts_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("parquet") {
+                if let Some(filename) = path.file_stem().and_then(|s| s.to_str()) {
+                    // Parse part number from filename
+                    // Orderbook format: part_TIMESTAMP_SEQ_PART.parquet
+                    // Trades format: part_TIMESTAMP_PART.parquet
+                    if filename.starts_with(pattern_prefix) {
+                        // Extract the last numeric segment (part number)
+                        let parts: Vec<&str> = filename.split('_').collect();
+                        if let Some(part_str) = parts.last() {
+                            if let Ok(part_num) = part_str.parse::<usize>() {
+                                if part_num >= max_part {
+                                    max_part = part_num + 1; // Next available number
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    max_part
+}
 
 fn min_quantity_threshold() -> Decimal {
     Decimal::new(1, 9) // 1e-9
@@ -57,12 +99,12 @@ pub struct OrderbookParquetWriter {
 
     // Small batch for periodic writes to same file
     current_batch: Arc<Mutex<Vec<FlattenedSnapshot>>>,
-    
+
     // Current file writer (stays open until 100K rows)
     current_writer: Arc<Mutex<Option<ArrowWriter<File>>>>,
     current_file_rows: Arc<Mutex<usize>>,
     current_file_path: Arc<Mutex<Option<PathBuf>>>,
-    
+
     last_flush: Arc<Mutex<Instant>>,
     part_counter: Arc<Mutex<usize>>,
 }
@@ -104,12 +146,32 @@ impl OrderbookParquetWriter {
             CollectorState::new(market.to_string())
         };
 
+        // Initialize part_counter from state or by scanning existing files
+        // This prevents file overwrites after restart
+        let initial_part_counter = if state.orderbook_part_counter > 0 {
+            info!(
+                "Resuming orderbook part counter from state: {}",
+                state.orderbook_part_counter
+            );
+            state.orderbook_part_counter
+        } else {
+            // Scan existing files to find the highest part number
+            let scanned = scan_max_part_number(&parts_dir, "part_");
+            if scanned > 0 {
+                info!(
+                    "Scanned existing orderbook files, starting part counter at: {}",
+                    scanned
+                );
+            }
+            scanned
+        };
+
         let last_seq = Arc::new(Mutex::new(state.last_orderbook_seq));
         let state = Arc::new(Mutex::new(state));
 
         info!(
-            "Initialized Parquet writer for {} (max_levels={}, flush_interval={}s)",
-            market, max_levels, FLUSH_INTERVAL_SECS
+            "Initialized Parquet writer for {} (max_levels={}, flush_interval={}s, schema_version={})",
+            market, max_levels, FLUSH_INTERVAL_SECS, ORDERBOOK_SCHEMA_VERSION
         );
 
         Ok(Self {
@@ -124,7 +186,7 @@ impl OrderbookParquetWriter {
             current_file_rows: Arc::new(Mutex::new(0)),
             current_file_path: Arc::new(Mutex::new(None)),
             last_flush: Arc::new(Mutex::new(Instant::now())),
-            part_counter: Arc::new(Mutex::new(0)),
+            part_counter: Arc::new(Mutex::new(initial_part_counter)),
         })
     }
 
@@ -155,7 +217,10 @@ impl OrderbookParquetWriter {
                         );
                         // Allow it to proceed
                     } else {
-                        debug!("Skipping duplicate/old orderbook seq: {} <= {}", msg.seq, prev_seq);
+                        debug!(
+                            "Skipping duplicate/old orderbook seq: {} <= {}",
+                            msg.seq, prev_seq
+                        );
                         return Ok(());
                     }
                 } else if msg.seq > prev_seq + 1 {
@@ -172,9 +237,12 @@ impl OrderbookParquetWriter {
                     } else {
                         // For DELTA messages, we cannot safely continue
                         // Return error to trigger reconnection at the collect_data level
-                        return Err(crate::error::ConnectorError::ApiError(
-                            format!("Sequence gap detected: expected {}, got {}", prev_seq + 1, msg.seq)
-                        ).into());
+                        return Err(crate::error::ConnectorError::ApiError(format!(
+                            "Sequence gap detected: expected {}, got {}",
+                            prev_seq + 1,
+                            msg.seq
+                        ))
+                        .into());
                     }
                 }
             }
@@ -240,15 +308,35 @@ impl OrderbookParquetWriter {
             let mut ask_qtys = Vec::with_capacity(self.max_levels);
 
             for level in 0..self.max_levels {
-                let (bid_price, bid_qty) = bids.get(level).copied()
+                let (bid_price, bid_qty) = bids
+                    .get(level)
+                    .copied()
                     .unwrap_or((Decimal::ZERO, Decimal::ZERO));
-                let (ask_price, ask_qty) = asks.get(level).copied()
+                let (ask_price, ask_qty) = asks
+                    .get(level)
+                    .copied()
                     .unwrap_or((Decimal::ZERO, Decimal::ZERO));
 
-                bid_prices.push(if bid_price.is_zero() { None } else { Some(bid_price.to_f64().unwrap_or(0.0)) });
-                bid_qtys.push(if bid_qty.is_zero() { None } else { Some(bid_qty.to_f64().unwrap_or(0.0)) });
-                ask_prices.push(if ask_price.is_zero() { None } else { Some(ask_price.to_f64().unwrap_or(0.0)) });
-                ask_qtys.push(if ask_qty.is_zero() { None } else { Some(ask_qty.to_f64().unwrap_or(0.0)) });
+                bid_prices.push(if bid_price.is_zero() {
+                    None
+                } else {
+                    Some(bid_price.to_f64().unwrap_or(0.0))
+                });
+                bid_qtys.push(if bid_qty.is_zero() {
+                    None
+                } else {
+                    Some(bid_qty.to_f64().unwrap_or(0.0))
+                });
+                ask_prices.push(if ask_price.is_zero() {
+                    None
+                } else {
+                    Some(ask_price.to_f64().unwrap_or(0.0))
+                });
+                ask_qtys.push(if ask_qty.is_zero() {
+                    None
+                } else {
+                    Some(ask_qty.to_f64().unwrap_or(0.0))
+                });
             }
 
             FlattenedSnapshot {
@@ -283,7 +371,7 @@ impl OrderbookParquetWriter {
             if state.orderbook_updates_count % 100 == 0 {
                 let state_path = self.parts_dir.parent().unwrap().join("state.json");
                 if let Err(e) = state.save_to_file(&state_path) {
-                   warn!("Failed to save state: {}", e);
+                    warn!("Failed to save state: {}", e);
                 }
             }
         }
@@ -303,7 +391,10 @@ impl OrderbookParquetWriter {
             if current_batch.is_empty() {
                 return Ok(());
             }
-            std::mem::replace(&mut *current_batch, Vec::with_capacity(FLUSH_BATCH_SIZE))
+            std::mem::replace(
+                &mut *current_batch,
+                Vec::with_capacity(TRADE_FLUSH_BATCH_SIZE),
+            )
         };
 
         if batch.is_empty() {
@@ -317,13 +408,17 @@ impl OrderbookParquetWriter {
         let mut file_rows_lock = self.current_file_rows.lock().await;
         let mut file_path_lock = self.current_file_path.lock().await;
 
-        // If no writer OR current file would exceed 100K, close and start new file
+        // If no writer OR current file would exceed MAX_ROWS, close and start new file
         if writer_lock.is_none() || (*file_rows_lock + batch_size) > MAX_ROWS_PER_FILE {
             // Close current writer if exists
             if let Some(writer) = writer_lock.take() {
-                writer.close()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
-                
+                writer.close().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to close writer: {}", e),
+                    )
+                })?;
+
                 if let Some(path) = file_path_lock.take() {
                     info!(
                         "Closed parquet file {} with {} rows (reached {}K limit)",
@@ -335,46 +430,80 @@ impl OrderbookParquetWriter {
                 *file_rows_lock = 0;
             }
 
-            // Generate filename for new file
+            // Generate filename for new file and update part counter
             let first_ts = batch[0].timestamp_ms;
             let first_seq = batch[0].seq;
             let part_num = {
                 let mut counter = self.part_counter.lock().await;
                 let num = *counter;
                 *counter += 1;
+
+                // Persist part_counter to state to prevent overwrites after restart
+                let mut state = self.state.lock().await;
+                state.orderbook_part_counter = *counter;
+
                 num
             };
 
-            let filename = format!("part_{:013}_{:010}_{:06}.parquet", first_ts, first_seq, part_num);
+            let filename = format!(
+                "part_{:013}_{:010}_{:06}.parquet",
+                first_ts, first_seq, part_num
+            );
             let file_path = self.parts_dir.join(&filename);
 
-            // Create new file and writer
+            // Create new file and writer with schema version metadata
             let file = File::create(&file_path)?;
             let props = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap()))
+                .set_compression(Compression::ZSTD(
+                    parquet::basic::ZstdLevel::try_new(3).unwrap(),
+                ))
                 .set_max_row_group_size(2000)
+                .set_key_value_metadata(Some(vec![
+                    KeyValue::new(
+                        "schema_version".to_string(),
+                        ORDERBOOK_SCHEMA_VERSION.to_string(),
+                    ),
+                    KeyValue::new("market".to_string(), self.market.clone()),
+                    KeyValue::new("max_levels".to_string(), self.max_levels.to_string()),
+                ]))
                 .build();
 
             let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create writer: {}", e)))?;
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create writer: {}", e),
+                    )
+                })?;
 
             *writer_lock = Some(new_writer);
             *file_path_lock = Some(file_path.clone());
             *file_rows_lock = 0;
 
-            info!("Created new parquet file: {} (will grow to {}K rows)", filename, MAX_ROWS_PER_FILE / 1000);
+            info!(
+                "Created new parquet file: {} (will grow to {}K rows)",
+                filename,
+                MAX_ROWS_PER_FILE / 1000
+            );
         }
 
         // Write batch to current open file
         let record_batch = self.build_record_batch(&batch, &schema)?;
-        let current_file_path = file_path_lock.clone();
 
         if let Some(writer) = writer_lock.as_mut() {
-            writer.write(&record_batch)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
+            writer.write(&record_batch).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to write batch: {}", e),
+                )
+            })?;
 
-            writer.flush()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush writer: {}", e)))?;
+            writer.flush().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to flush writer: {}", e),
+                )
+            })?;
 
             *file_rows_lock += batch_size;
 
@@ -387,17 +516,6 @@ impl OrderbookParquetWriter {
             );
         }
 
-        // CRITICAL: Force sync to disk (fixes Docker volume buffering)
-        // ArrowWriter.flush() only flushes to OS buffer, not to disk
-        // This ensures data is visible in Docker volumes immediately
-        if let Some(path) = current_file_path {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                if let Err(e) = file.sync_data() {
-                    warn!("Failed to sync file to disk: {}", e);
-                }
-            }
-        }
-
         // Update last flush time
         *self.last_flush.lock().await = Instant::now();
 
@@ -406,23 +524,46 @@ impl OrderbookParquetWriter {
 
     fn build_schema(&self) -> Schema {
         let mut fields = vec![
-            Field::new("timestamp_ms", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+            Field::new(
+                "timestamp_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
             Field::new("market", DataType::Utf8, false),
             Field::new("seq", DataType::Int64, false),
         ];
 
         for i in 0..self.max_levels {
-            fields.push(Field::new(format!("bid_price_{}", i), DataType::Float64, true));
-            fields.push(Field::new(format!("bid_qty_{}", i), DataType::Float64, true));
-            fields.push(Field::new(format!("ask_price_{}", i), DataType::Float64, true));
-            fields.push(Field::new(format!("ask_qty_{}", i), DataType::Float64, true));
+            fields.push(Field::new(
+                format!("bid_price_{}", i),
+                DataType::Float64,
+                true,
+            ));
+            fields.push(Field::new(
+                format!("bid_qty_{}", i),
+                DataType::Float64,
+                true,
+            ));
+            fields.push(Field::new(
+                format!("ask_price_{}", i),
+                DataType::Float64,
+                true,
+            ));
+            fields.push(Field::new(
+                format!("ask_qty_{}", i),
+                DataType::Float64,
+                true,
+            ));
         }
 
         Schema::new(fields)
     }
 
-    fn build_record_batch(&self, batch: &[FlattenedSnapshot], schema: &Schema) -> Result<RecordBatch> {
-
+    fn build_record_batch(
+        &self,
+        batch: &[FlattenedSnapshot],
+        schema: &Schema,
+    ) -> Result<RecordBatch> {
         // Build timestamp array
         let timestamps: Vec<i64> = batch.iter().map(|s| s.timestamp_ms).collect();
         let timestamp_array = Arc::new(TimestampMillisecondArray::from(timestamps)) as ArrayRef;
@@ -440,32 +581,41 @@ impl OrderbookParquetWriter {
 
         for level in 0..self.max_levels {
             // Bid price
-            let bid_prices: Vec<Option<f64>> = batch.iter()
+            let bid_prices: Vec<Option<f64>> = batch
+                .iter()
                 .map(|s| s.bid_prices.get(level).copied().flatten())
                 .collect();
             columns.push(Arc::new(Float64Array::from(bid_prices)) as ArrayRef);
 
             // Bid qty
-            let bid_qtys: Vec<Option<f64>> = batch.iter()
+            let bid_qtys: Vec<Option<f64>> = batch
+                .iter()
                 .map(|s| s.bid_qtys.get(level).copied().flatten())
                 .collect();
             columns.push(Arc::new(Float64Array::from(bid_qtys)) as ArrayRef);
 
             // Ask price
-            let ask_prices: Vec<Option<f64>> = batch.iter()
+            let ask_prices: Vec<Option<f64>> = batch
+                .iter()
                 .map(|s| s.ask_prices.get(level).copied().flatten())
                 .collect();
             columns.push(Arc::new(Float64Array::from(ask_prices)) as ArrayRef);
 
             // Ask qty
-            let ask_qtys: Vec<Option<f64>> = batch.iter()
+            let ask_qtys: Vec<Option<f64>> = batch
+                .iter()
                 .map(|s| s.ask_qtys.get(level).copied().flatten())
                 .collect();
             columns.push(Arc::new(Float64Array::from(ask_qtys)) as ArrayRef);
         }
 
-        RecordBatch::try_new(Arc::new(schema.clone()), columns)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create RecordBatch: {}", e)).into())
+        RecordBatch::try_new(Arc::new(schema.clone()), columns).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create RecordBatch: {}", e),
+            )
+            .into()
+        })
     }
 
     pub async fn get_stats(&self) -> (u64, Option<u64>, Option<u64>) {
@@ -481,9 +631,9 @@ impl OrderbookParquetWriter {
         // Flush current batch
         self.flush_current_batch().await?;
 
-        // Note: We do NOT close the writer here anymore. 
+        // Note: We do NOT close the writer here anymore.
         // We keep it open to allow appending until 100K rows.
-        // The writer will be closed by close_writer() on shutdown 
+        // The writer will be closed by close_writer() on shutdown
         // or by flush_current_batch() when rotating files.
 
         let state = self.state.lock().await;
@@ -504,9 +654,16 @@ impl OrderbookParquetWriter {
         let mut writer_lock = self.current_writer.lock().await;
         if let Some(writer) = writer_lock.take() {
             let file_rows = *self.current_file_rows.lock().await;
-            writer.close()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
-            info!("Closed final parquet file with {} rows on shutdown", file_rows);
+            writer.close().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to close writer: {}", e),
+                )
+            })?;
+            info!(
+                "Closed final parquet file with {} rows on shutdown",
+                file_rows
+            );
         }
         Ok(())
     }
@@ -549,15 +706,16 @@ pub struct TradesParquetWriter {
     parts_dir: PathBuf,
     state: Arc<Mutex<CollectorState>>,
     seen_trade_ids: Arc<Mutex<HashSet<i64>>>,
-    
+    market: String,
+
     // Small batch for periodic writes to same file
     current_batch: Arc<Mutex<Vec<FlattenedTrade>>>,
-    
+
     // Current file writer
     current_writer: Arc<Mutex<Option<ArrowWriter<File>>>>,
     current_file_rows: Arc<Mutex<usize>>,
     current_file_path: Arc<Mutex<Option<PathBuf>>>,
-    
+
     last_flush: Arc<Mutex<Instant>>,
     part_counter: Arc<Mutex<usize>>,
 }
@@ -599,40 +757,65 @@ impl TradesParquetWriter {
             CollectorState::new(market.to_string())
         };
 
+        // Initialize part_counter from state or by scanning existing files
+        // This prevents file overwrites after restart
+        let initial_part_counter = if state.trades_part_counter > 0 {
+            info!(
+                "Resuming trades part counter from state: {}",
+                state.trades_part_counter
+            );
+            state.trades_part_counter
+        } else {
+            // Scan existing files to find the highest part number
+            let scanned = scan_max_part_number(&parts_dir, "part_");
+            if scanned > 0 {
+                info!(
+                    "Scanned existing trades files, starting part counter at: {}",
+                    scanned
+                );
+            }
+            scanned
+        };
+
         // We don't load all trade IDs into memory to avoid high RAM usage
         // Instead relies on state.last_trade_id for some deduplication
         let seen_trade_ids = Arc::new(Mutex::new(HashSet::new()));
         let state = Arc::new(Mutex::new(state));
 
         info!(
-            "Initialized Parquet trade writer for {} (flush_interval={}s)",
-            market, FLUSH_INTERVAL_SECS
+            "Initialized Parquet trade writer for {} (flush_interval={}s, schema_version={})",
+            market, FLUSH_INTERVAL_SECS, TRADES_SCHEMA_VERSION
         );
 
         Ok(Self {
             parts_dir,
             state,
             seen_trade_ids,
-            current_batch: Arc::new(Mutex::new(Vec::with_capacity(FLUSH_BATCH_SIZE))),
+            market: market.to_string(),
+            current_batch: Arc::new(Mutex::new(Vec::with_capacity(TRADE_FLUSH_BATCH_SIZE))),
             current_writer: Arc::new(Mutex::new(None)),
             current_file_rows: Arc::new(Mutex::new(0)),
             current_file_path: Arc::new(Mutex::new(None)),
             last_flush: Arc::new(Mutex::new(Instant::now())),
-            part_counter: Arc::new(Mutex::new(0)),
+            part_counter: Arc::new(Mutex::new(initial_part_counter)),
         })
     }
 
     pub async fn write_trade(&self, trade: &PublicTrade) -> Result<()> {
-        let mut state = self.state.lock().await;
-        
-        // Check if trade ID already processed via state (simple check)
-        if let Some(last_id) = state.last_trade_id {
-            if trade.i <= last_id {
-                // Potential duplicate or out of order
-                debug!("Skipping potential duplicate/old trade ID: {} <= {}", trade.i, last_id);
-                // To be safe against simple duplicates in stream
-                if trade.i == last_id {
-                    return Ok(());
+        // Check if trade ID already processed via state (simple check) without holding the lock across awaits
+        {
+            let state = self.state.lock().await;
+            if let Some(last_id) = state.last_trade_id {
+                if trade.i <= last_id {
+                    // Potential duplicate or out of order
+                    debug!(
+                        "Skipping potential duplicate/old trade ID: {} <= {}",
+                        trade.i, last_id
+                    );
+                    // To be safe against simple duplicates in stream
+                    if trade.i == last_id {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -653,19 +836,22 @@ impl TradesParquetWriter {
         let should_flush = {
             let mut batch = self.current_batch.lock().await;
             batch.push(flattened);
-            batch.len() >= FLUSH_BATCH_SIZE
+            batch.len() >= TRADE_FLUSH_BATCH_SIZE
         };
 
-        // Update state
-        state.last_trade_id = Some(trade.i);
-        state.last_trade_timestamp = Some(trade.t);
-        state.trades_count += 1;
+        // Update state (separate scope so flush_current_batch() cannot deadlock on the same lock)
+        {
+            let mut state = self.state.lock().await;
+            state.last_trade_id = Some(trade.i);
+            state.last_trade_timestamp = Some(trade.t);
+            state.trades_count += 1;
 
-        // Save state every 100 trades
-        if state.trades_count % 100 == 0 {
-            let state_path = self.parts_dir.parent().unwrap().join("state.json");
-            if let Err(e) = state.save_to_file(&state_path) {
-                warn!("Failed to save state: {}", e);
+            // Save state every 100 trades
+            if state.trades_count % 100 == 0 {
+                let state_path = self.parts_dir.parent().unwrap().join("state.json");
+                if let Err(e) = state.save_to_file(&state_path) {
+                    warn!("Failed to save state: {}", e);
+                }
             }
         }
 
@@ -684,7 +870,10 @@ impl TradesParquetWriter {
             if current_batch.is_empty() {
                 return Ok(());
             }
-            std::mem::replace(&mut *current_batch, Vec::with_capacity(FLUSH_BATCH_SIZE))
+            std::mem::replace(
+                &mut *current_batch,
+                Vec::with_capacity(TRADE_FLUSH_BATCH_SIZE),
+            )
         };
 
         if batch.is_empty() {
@@ -699,11 +888,15 @@ impl TradesParquetWriter {
         let mut file_path_lock = self.current_file_path.lock().await;
 
         // If no writer OR current file would exceed MAX_ROWS, close and start new file
-        if writer_lock.is_none() || (*file_rows_lock + batch_size) > MAX_ROWS_PER_FILE {
-             // Close current writer if exists
+        if writer_lock.is_none() || (*file_rows_lock + batch_size) > MAX_TRADE_ROWS_PER_FILE {
+            // Close current writer if exists
             if let Some(writer) = writer_lock.take() {
-                writer.close()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+                writer.close().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to close writer: {}", e),
+                    )
+                })?;
 
                 if let Some(path) = file_path_lock.take() {
                     info!(
@@ -715,12 +908,17 @@ impl TradesParquetWriter {
                 *file_rows_lock = 0;
             }
 
-            // Generate filename for new file
+            // Generate filename for new file and update part counter
             let first_ts = batch[0].timestamp_ms;
             let part_num = {
                 let mut counter = self.part_counter.lock().await;
                 let num = *counter;
                 *counter += 1;
+
+                // Persist part_counter to state to prevent overwrites after restart
+                let mut state = self.state.lock().await;
+                state.trades_part_counter = *counter;
+
                 num
             };
 
@@ -728,18 +926,30 @@ impl TradesParquetWriter {
             let filename = format!("part_{:013}_{:06}.parquet", first_ts, part_num);
             let file_path = self.parts_dir.join(&filename);
 
-            // Create new file and writer
+            // Create new file and writer with schema version metadata
             let file = File::create(&file_path)?;
             let props = WriterProperties::builder()
-                .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap()))
-                // Use very small row group size for trades since they arrive infrequently
-                // This ensures data is written to disk immediately instead of buffering
-                // Previous values (2000, 50) caused 0 KB files in Docker until shutdown
-                .set_max_row_group_size(10)
+                .set_compression(Compression::ZSTD(
+                    parquet::basic::ZstdLevel::try_new(3).unwrap(),
+                ))
+                // Keep row groups small but not tiny to avoid file bloat; writer.flush() is called explicitly
+                .set_max_row_group_size(2048)
+                .set_key_value_metadata(Some(vec![
+                    KeyValue::new(
+                        "schema_version".to_string(),
+                        TRADES_SCHEMA_VERSION.to_string(),
+                    ),
+                    KeyValue::new("market".to_string(), self.market.clone()),
+                ]))
                 .build();
 
             let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create writer: {}", e)))?;
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create writer: {}", e),
+                    )
+                })?;
 
             *writer_lock = Some(new_writer);
             *file_path_lock = Some(file_path.clone());
@@ -750,34 +960,28 @@ impl TradesParquetWriter {
 
         // Write batch to current open file
         let record_batch = self.build_record_batch(&batch, &schema)?;
-        let current_file_path = file_path_lock.clone();
 
         if let Some(writer) = writer_lock.as_mut() {
-            writer.write(&record_batch)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
+            writer.write(&record_batch).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to write batch: {}", e),
+                )
+            })?;
 
-            writer.flush()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush writer: {}", e)))?;
+            writer.flush().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to flush writer: {}", e),
+                )
+            })?;
 
             *file_rows_lock += batch_size;
 
             debug!(
                 "Wrote {} trades to current file (total: {}/{})",
-                batch_size,
-                *file_rows_lock,
-                MAX_ROWS_PER_FILE
+                batch_size, *file_rows_lock, MAX_TRADE_ROWS_PER_FILE
             );
-        }
-
-        // CRITICAL: Force sync to disk (fixes Docker volume buffering)
-        // ArrowWriter.flush() only flushes to OS buffer, not to disk
-        // This ensures data is visible in Docker volumes immediately
-        if let Some(path) = current_file_path {
-            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
-                if let Err(e) = file.sync_data() {
-                    warn!("Failed to sync file to disk: {}", e);
-                }
-            }
         }
 
         // Update last flush time
@@ -788,7 +992,11 @@ impl TradesParquetWriter {
 
     fn build_schema(&self) -> Schema {
         Schema::new(vec![
-            Field::new("timestamp_ms", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+            Field::new(
+                "timestamp_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
             Field::new("price", DataType::Float64, false),
             Field::new("quantity", DataType::Float64, false),
             Field::new("is_buyer_maker", DataType::Boolean, false),
@@ -808,13 +1016,22 @@ impl TradesParquetWriter {
             Arc::new(BooleanArray::from(makers)),
         ];
 
-        RecordBatch::try_new(Arc::new(schema.clone()), columns)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create RecordBatch: {}", e)).into())
+        RecordBatch::try_new(Arc::new(schema.clone()), columns).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create RecordBatch: {}", e),
+            )
+            .into()
+        })
     }
 
     pub async fn get_stats(&self) -> (u64, Option<i64>, Option<u64>) {
         let state = self.state.lock().await;
-        (state.trades_count, state.last_trade_id, state.last_trade_timestamp)
+        (
+            state.trades_count,
+            state.last_trade_id,
+            state.last_trade_timestamp,
+        )
     }
 
     pub async fn save_state(&self) -> Result<()> {
@@ -822,18 +1039,25 @@ impl TradesParquetWriter {
         let state = self.state.lock().await;
         let state_path = self.parts_dir.parent().unwrap().join("state.json");
         state.save_to_file(&state_path)?;
-        info!("Saved state for {}: {} trades", state.market, state.trades_count);
+        info!(
+            "Saved state for {}: {} trades",
+            state.market, state.trades_count
+        );
         Ok(())
     }
 
     pub async fn close_writer(&self) -> Result<()> {
         self.flush_current_batch().await?;
-        
+
         let mut writer_lock = self.current_writer.lock().await;
         if let Some(writer) = writer_lock.take() {
             let file_rows = *self.current_file_rows.lock().await;
-            writer.close()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+            writer.close().map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to close writer: {}", e),
+                )
+            })?;
             info!("Closed final parquet trade file with {} rows", file_rows);
         }
         Ok(())
@@ -842,7 +1066,7 @@ impl TradesParquetWriter {
     pub async fn close(&self) -> Result<()> {
         self.close_writer().await
     }
-    
+
     pub async fn force_flush(&self) -> Result<()> {
         let elapsed_secs = self.last_flush.lock().await.elapsed().as_secs();
         let batch_size = self.current_batch.lock().await.len();
