@@ -1,7 +1,6 @@
 use crate::model_types::TradeEvent;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
-use std::collections::HashMap;
 
 // ============================================================================
 // Constants
@@ -10,20 +9,14 @@ use std::collections::HashMap;
 /// Minimum samples required for variance calculation (need at least 2 for sample variance)
 const MIN_SAMPLES_FOR_VARIANCE: usize = 2;
 
-/// Minimum deltas required for regression
-const MIN_DELTAS_FOR_REGRESSION: usize = 10;
-
-/// Minimum data points for linear regression
-const MIN_POINTS_FOR_REGRESSION: usize = 2;
+/// Minimum trades required for MLE estimation
+const MIN_TRADES_FOR_ESTIMATION: usize = 5;
 
 /// Default kappa when calibration fails
 const DEFAULT_KAPPA: f64 = 10.0;
 
 /// Default A when calibration fails
 const DEFAULT_A: f64 = 10.0;
-
-/// Epsilon for floating point comparisons
-const EPSILON: f64 = 1e-9;
 
 // ============================================================================
 // Volatility Calculation
@@ -91,75 +84,41 @@ pub fn calculate_volatility(
 // Intensity Parameter Fitting
 // ============================================================================
 
-/// Perform linear regression on one side (bid or ask) to extract kappa and A
+/// Estimate intensity parameters kappa and A using Maximum Likelihood Estimation (MLE)
+/// assuming a Poisson process with exponential intensity decay.
 ///
 /// Model: λ(δ) = A * exp(-κ * δ)
-/// Taking log: ln(λ) = ln(A) - κ * δ
-/// Linear regression: y = α + β * x, where y = ln(rate), x = delta
-/// Therefore: A = exp(α), κ = -β
-fn regress_side(
+/// MLE Estimators:
+///   κ = 1 / mean(δ)
+///   A = (N * κ) / T
+/// where N is number of trades and T is window duration.
+fn estimate_mle_side(
     deltas: &[f64],
     window_duration_seconds: f64,
-    tick_size: f64,
 ) -> Option<(f64, f64)> {
-    if deltas.len() < MIN_DELTAS_FOR_REGRESSION 
-        || window_duration_seconds <= 0.0 
-        || tick_size <= 0.0 
-    {
+    if deltas.len() < MIN_TRADES_FOR_ESTIMATION || window_duration_seconds <= 0.0 {
         return None;
     }
 
-    // Bin deltas by tick size
-    let mut bins: HashMap<i64, usize> = HashMap::with_capacity(deltas.len() / 2);
-
-    for delta in deltas {
-        let ticks = (delta / tick_size).round() as i64;
-        if ticks >= 0 {
-            *bins.entry(ticks).or_insert(0) += 1;
-        }
-    }
-
-    // Prepare regression data
-    let mut x_data = Vec::with_capacity(bins.len());
-    let mut y_data = Vec::with_capacity(bins.len());
-
-    for (tick_idx, count) in bins {
-        let delta_price = tick_idx as f64 * tick_size;
-        let rate = count as f64 / window_duration_seconds;
-
-        // Only include positive rates (ln(0) is undefined)
-        if rate > 0.0 {
-            let ln_rate = rate.ln();
-            // Skip if ln produced non-finite value
-            if ln_rate.is_finite() {
-                x_data.push(delta_price);
-                y_data.push(ln_rate);
-            }
-        }
-    }
-
-    if x_data.len() < MIN_POINTS_FOR_REGRESSION {
+    let n = deltas.len() as f64;
+    let sum_deltas: f64 = deltas.iter().sum();
+    
+    if sum_deltas <= 0.0 {
         return None;
     }
 
-    // Ordinary least squares regression
-    let n = x_data.len() as f64;
-    let sum_x: f64 = x_data.iter().sum();
-    let sum_y: f64 = y_data.iter().sum();
-    let sum_xy: f64 = x_data.iter().zip(y_data.iter()).map(|(x, y)| x * y).sum();
-    let sum_xx: f64 = x_data.iter().map(|x| x * x).sum();
+    let mean_delta = sum_deltas / n;
+    
+    // MLE for Exponential distribution parameter (beta = 1/lambda in some notations, here kappa)
+    // If P(delta) ~ exp(-kappa * delta), then kappa = 1 / mean(delta)
+    let kappa = 1.0 / mean_delta;
 
-    let denominator = n * sum_xx - sum_x * sum_x;
-    if denominator.abs() < EPSILON {
-        return None;
-    }
-
-    let beta = (n * sum_xy - sum_x * sum_y) / denominator;
-    let alpha = (sum_y - beta * sum_x) / n;
-
-    // Extract parameters: κ = -β, A = exp(α)
-    let kappa = -beta;
-    let a = alpha.exp();
+    // MLE for A involves the total count N over time T
+    // N ~ Poisson(integral(lambda(delta)) * T)
+    // integral_0_inf A*exp(-k*d) dd = A/k
+    // E[N] = (A/k) * T
+    // A = (N * k) / T
+    let a = (n * kappa) / window_duration_seconds;
 
     // Validate results
     if !kappa.is_finite() || !a.is_finite() || kappa <= 0.0 || a <= 0.0 {
@@ -183,13 +142,13 @@ fn find_mid_price_index(mid_prices: &[(u64, Decimal)], target_ts: u64, hint: usi
     idx
 }
 
-/// Calibrates intensity parameters A and kappa using regression on trade arrival rates
+/// Calibrates intensity parameters A and kappa using MLE on trade arrival rates
 ///
 /// # Arguments
 /// * `trades` - List of trades in the window
 /// * `mid_prices` - History of mid-prices (timestamp, price) sorted by timestamp
 /// * `window_duration_seconds` - The duration of the window in seconds
-/// * `tick_size` - The tick size for binning (e.g., 0.01)
+/// * `tick_size` - Ignored by MLE (retained for API compatibility)
 ///
 /// # Returns
 /// Tuple of (bid_kappa, bid_a, ask_kappa, ask_a) parameters
@@ -197,7 +156,7 @@ pub fn fit_intensity_parameters(
     trades: &[TradeEvent],
     mid_prices: &[(u64, Decimal)],
     window_duration_seconds: f64,
-    tick_size: f64,
+    _tick_size: f64,
 ) -> (f64, f64, f64, f64) {
     if trades.is_empty() || mid_prices.is_empty() || window_duration_seconds <= 0.0 {
         return (DEFAULT_KAPPA, DEFAULT_A, DEFAULT_KAPPA, DEFAULT_A);
@@ -243,8 +202,8 @@ pub fn fit_intensity_parameters(
     }
 
     // Fit both sides separately
-    let bid_fit = regress_side(&bid_deltas, window_duration_seconds, tick_size);
-    let ask_fit = regress_side(&ask_deltas, window_duration_seconds, tick_size);
+    let bid_fit = estimate_mle_side(&bid_deltas, window_duration_seconds);
+    let ask_fit = estimate_mle_side(&ask_deltas, window_duration_seconds);
 
     // Return side-specific results (no averaging)
     match (bid_fit, ask_fit) {

@@ -77,6 +77,11 @@ path = "src/bin/calculate_spread.rs"
 name = "migrate_orderbook_to_parquet"
 path = "src/bin/migrate_orderbook_to_parquet.rs"
 
+# Trade migration utility
+[[bin]]
+name = "migrate_trades_to_parquet"
+path = "src/bin/migrate_trades_to_parquet.rs"
+
 # Grid search with gamma (2D)
 [[bin]]
 name = "grid_search_gamma"

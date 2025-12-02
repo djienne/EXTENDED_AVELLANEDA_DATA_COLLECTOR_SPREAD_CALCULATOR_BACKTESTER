@@ -3,8 +3,8 @@
 //! This module implements continuous data collection from WebSocket streams,
 //! writing orderbook depth and trades to CSV files.
 
-use crate::data_collector::{OrderbookCsvWriter, TradesCsvWriter};
-use crate::storage::OrderbookParquetWriter;
+use crate::data_collector::OrderbookCsvWriter;
+use crate::storage::{OrderbookParquetWriter, TradesParquetWriter};
 use crate::websocket::WebSocketClient;
 use crate::error::Result;
 use tokio::sync::{mpsc, Mutex};
@@ -60,7 +60,7 @@ pub async fn run_data_collection_task(
 
     let trades_writer = if config.collect_trades {
         Some(Arc::new(Mutex::new(
-            TradesCsvWriter::new(Path::new(&config.data_directory), &config.market)?
+            TradesParquetWriter::new(Path::new(&config.data_directory), &config.market)?
         )))
     } else {
         None
@@ -196,7 +196,7 @@ pub async fn run_data_collection_task(
             info!("Trades handler started for {}", market);
 
             while let Some(trade) = rx.recv().await {
-                // Write to CSV
+                // Write to Parquet
                 if let Some(ref writer) = writer {
                     let writer_guard = writer.lock().await;
                     if let Err(e) = writer_guard.write_trade(&trade).await {

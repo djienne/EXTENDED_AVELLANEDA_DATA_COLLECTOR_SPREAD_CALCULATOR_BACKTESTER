@@ -4,7 +4,7 @@
 /// for the given market conditions and parameters.
 
 use extended_data_collector::backtest_engine::{run_backtest, BacktestParams, BacktestResults};
-use extended_data_collector::data_loader::DataLoader;
+use extended_data_collector::data_loader::{DataLoader, DataEvent};
 use extended_data_collector::model_types::ASConfig;
 use rayon::prelude::*;
 use rust_decimal::Decimal;
@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 // =============================================================================
 // Constants
@@ -181,10 +182,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load data loader
     println!("Initializing data loader...");
-    let loader = Arc::new(DataLoader::new(
+    let loader = DataLoader::new(
         Path::new(&trades_path),
         Path::new(&orderbook_path),
-    ));
+    );
+
+    println!("Loading all data into memory for performance...");
+    let start_load = Instant::now();
+    let events = loader.load_all_events()?;
+    let duration = start_load.elapsed();
+    println!("Loaded {} events in {:.2}s", events.len(), duration.as_secs_f64());
 
     println!("Testing {} time horizons...", horizons.len());
     println!(
@@ -206,7 +213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_parallel_backtests(
             &horizons,
             &base_config,
-            &loader,
+            &events,
             initial_capital_dec,
             order_notional_dec,
         )
@@ -214,7 +221,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_sequential_backtests(
             &horizons,
             &base_config,
-            &loader,
+            &events,
             initial_capital_dec,
             order_notional_dec,
         )?
@@ -248,7 +255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_sequential_backtests(
     horizons: &[u64],
     base_config: &ASConfig,
-    loader: &DataLoader,
+    events: &[DataEvent],
     initial_capital: Decimal,
     order_notional: Decimal,
 ) -> io::Result<Vec<(u64, Result<BacktestResults, String>)>> {
@@ -266,35 +273,28 @@ fn run_sequential_backtests(
         let mut config = base_config.clone();
         config.inventory_horizon_seconds = horizon;
 
-        let result = match loader.stream() {
-            Ok(data_stream) => {
-                let params = BacktestParams {
-                    data_stream,
-                    config,
-                    initial_capital,
-                    order_notional,
-                    output_csv_path: None,
-                    verbose: false,
-                };
+        let data_stream = events.iter().cloned().map(Ok);
+        let params = BacktestParams {
+            data_stream,
+            config,
+            initial_capital,
+            order_notional,
+            output_csv_path: None,
+            verbose: false,
+        };
 
-                match run_backtest(params) {
-                    Ok(result) => {
-                        println!(
-                            "[OK] PnL: ${:.2}, Fills: {}, Vol: ${:.2}",
-                            result.final_pnl,
-                            result.total_fills(),
-                            result.total_notional_volume
-                        );
-                        Ok(result)
-                    }
-                    Err(e) => {
-                        println!("[FAIL] Error: {}", e);
-                        Err(e.to_string())
-                    }
-                }
+        let result = match run_backtest(params) {
+            Ok(result) => {
+                println!(
+                    "[OK] PnL: ${:.2}, Fills: {}, Vol: ${:.2}",
+                    result.final_pnl,
+                    result.total_fills(),
+                    result.total_notional_volume
+                );
+                Ok(result)
             }
             Err(e) => {
-                println!("[FAIL] Stream error: {}", e);
+                println!("[FAIL] Error: {}", e);
                 Err(e.to_string())
             }
         };
@@ -308,12 +308,16 @@ fn run_sequential_backtests(
 fn run_parallel_backtests(
     horizons: &[u64],
     base_config: &ASConfig,
-    loader: &Arc<DataLoader>,
+    events: &[DataEvent],
     initial_capital: Decimal,
     order_notional: Decimal,
 ) -> Vec<(u64, Result<BacktestResults, String>)> {
     let progress = Arc::new(Mutex::new(0usize));
     let total = horizons.len();
+
+    // Note: We don't clone the entire events vector, just the slice reference is passed
+    // But par_iter works on horizons. Inside the closure, we need to iterate over events.
+    // events is a &Vec<DataEvent>. We can read it from multiple threads safely.
 
     horizons
         .par_iter()
@@ -321,21 +325,17 @@ fn run_parallel_backtests(
             let mut config = base_config.clone();
             config.inventory_horizon_seconds = horizon;
 
-            let result = match loader.stream() {
-                Ok(data_stream) => {
-                    let params = BacktestParams {
-                        data_stream,
-                        config,
-                        initial_capital,
-                        order_notional,
-                        output_csv_path: None,
-                        verbose: false,
-                    };
-
-                    run_backtest(params).map_err(|e| e.to_string())
-                }
-                Err(e) => Err(e.to_string()),
+            let data_stream = events.iter().cloned().map(Ok);
+            let params = BacktestParams {
+                data_stream,
+                config,
+                initial_capital,
+                order_notional,
+                output_csv_path: None,
+                verbose: false,
             };
+
+            let result = run_backtest(params).map_err(|e| e.to_string());
 
             // Update progress
             let mut prog = progress.lock().unwrap();

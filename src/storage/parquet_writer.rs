@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::data_collector::{CollectorState, OrderbookState};
-use crate::types::WsOrderBookMessage;
-use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampMillisecondArray};
+use crate::types::{WsOrderBookMessage, PublicTrade};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray, TimestampMillisecondArray, BooleanArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -10,6 +10,7 @@ use parquet::file::properties::WriterProperties;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +36,15 @@ struct FlattenedSnapshot {
     bid_qtys: Vec<Option<f64>>,
     ask_prices: Vec<Option<f64>>,
     ask_qtys: Vec<Option<f64>>,
+}
+
+/// Flattened trade for batching
+#[derive(Debug, Clone)]
+struct FlattenedTrade {
+    timestamp_ms: i64,
+    price: f64,
+    quantity: f64,
+    is_buyer_maker: bool,
 }
 
 pub struct OrderbookParquetWriter {
@@ -342,6 +352,7 @@ impl OrderbookParquetWriter {
             let file = File::create(&file_path)?;
             let props = WriterProperties::builder()
                 .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap()))
+                .set_max_row_group_size(2000)
                 .build();
 
             let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
@@ -516,10 +527,338 @@ impl OrderbookParquetWriter {
     /// Force flush of current batch (called by periodic background task)
     pub async fn force_flush(&self) -> Result<()> {
         let elapsed_secs = self.last_flush.lock().await.elapsed().as_secs();
-        if elapsed_secs >= FLUSH_INTERVAL_SECS {
-            debug!("Periodic flush triggered ({} seconds elapsed)", elapsed_secs);
+        let batch_size = self.current_batch.lock().await.len();
+
+        debug!(
+            "Periodic flush check: {} seconds elapsed, {} orderbook updates pending",
+            elapsed_secs, batch_size
+        );
+
+        // Always flush if there's data, regardless of time elapsed
+        // This is more aggressive but ensures data is written in Docker
+        if batch_size > 0 {
+            debug!("Force flushing {} pending orderbook updates", batch_size);
             self.flush_current_batch().await?;
         }
+
+        Ok(())
+    }
+}
+
+pub struct TradesParquetWriter {
+    parts_dir: PathBuf,
+    state: Arc<Mutex<CollectorState>>,
+    seen_trade_ids: Arc<Mutex<HashSet<i64>>>,
+    
+    // Small batch for periodic writes to same file
+    current_batch: Arc<Mutex<Vec<FlattenedTrade>>>,
+    
+    // Current file writer
+    current_writer: Arc<Mutex<Option<ArrowWriter<File>>>>,
+    current_file_rows: Arc<Mutex<usize>>,
+    current_file_path: Arc<Mutex<Option<PathBuf>>>,
+    
+    last_flush: Arc<Mutex<Instant>>,
+    part_counter: Arc<Mutex<usize>>,
+}
+
+impl TradesParquetWriter {
+    pub fn new(data_dir: &Path, market: &str) -> Result<Self> {
+        // Create data directory if it doesn't exist
+        fs::create_dir_all(data_dir)?;
+
+        // Create market-specific subdirectory
+        let market_dir = data_dir.join(market.replace("-", "_").to_lowercase());
+        fs::create_dir_all(&market_dir)?;
+
+        // Create parts subdirectory for Parquet files
+        let parts_dir = market_dir.join("trades_parts");
+        fs::create_dir_all(&parts_dir)?;
+
+        let state_path = market_dir.join("state.json");
+
+        // Load or create state
+        let state = if state_path.exists() {
+            match CollectorState::load_from_file(&state_path) {
+                Ok(s) => {
+                    info!(
+                        "Loaded existing state for {}: {} trades",
+                        market, s.trades_count
+                    );
+                    s
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to load state for {}: {}. Creating new state.",
+                        market, e
+                    );
+                    CollectorState::new(market.to_string())
+                }
+            }
+        } else {
+            CollectorState::new(market.to_string())
+        };
+
+        // We don't load all trade IDs into memory to avoid high RAM usage
+        // Instead relies on state.last_trade_id for some deduplication
+        let seen_trade_ids = Arc::new(Mutex::new(HashSet::new()));
+        let state = Arc::new(Mutex::new(state));
+
+        info!(
+            "Initialized Parquet trade writer for {} (flush_interval={}s)",
+            market, FLUSH_INTERVAL_SECS
+        );
+
+        Ok(Self {
+            parts_dir,
+            state,
+            seen_trade_ids,
+            current_batch: Arc::new(Mutex::new(Vec::with_capacity(FLUSH_BATCH_SIZE))),
+            current_writer: Arc::new(Mutex::new(None)),
+            current_file_rows: Arc::new(Mutex::new(0)),
+            current_file_path: Arc::new(Mutex::new(None)),
+            last_flush: Arc::new(Mutex::new(Instant::now())),
+            part_counter: Arc::new(Mutex::new(0)),
+        })
+    }
+
+    pub async fn write_trade(&self, trade: &PublicTrade) -> Result<()> {
+        let mut state = self.state.lock().await;
+        
+        // Check if trade ID already processed via state (simple check)
+        if let Some(last_id) = state.last_trade_id {
+            if trade.i <= last_id {
+                // Potential duplicate or out of order
+                debug!("Skipping potential duplicate/old trade ID: {} <= {}", trade.i, last_id);
+                // To be safe against simple duplicates in stream
+                if trade.i == last_id {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Parse fields
+        let price = trade.price_f64().unwrap_or(0.0);
+        let quantity = trade.qty_f64().unwrap_or(0.0);
+        let is_buyer_maker = trade.side_str() == "sell";
+
+        let flattened = FlattenedTrade {
+            timestamp_ms: trade.t as i64,
+            price,
+            quantity,
+            is_buyer_maker,
+        };
+
+        // Add to current batch
+        let should_flush = {
+            let mut batch = self.current_batch.lock().await;
+            batch.push(flattened);
+            batch.len() >= FLUSH_BATCH_SIZE
+        };
+
+        // Update state
+        state.last_trade_id = Some(trade.i);
+        state.last_trade_timestamp = Some(trade.t);
+        state.trades_count += 1;
+
+        // Save state every 100 trades
+        if state.trades_count % 100 == 0 {
+            let state_path = self.parts_dir.parent().unwrap().join("state.json");
+            if let Err(e) = state.save_to_file(&state_path) {
+                warn!("Failed to save state: {}", e);
+            }
+        }
+
+        // Flush batch to current file every FLUSH_BATCH_SIZE or FLUSH_INTERVAL_SECS
+        let elapsed_secs = self.last_flush.lock().await.elapsed().as_secs();
+        if should_flush || elapsed_secs >= FLUSH_INTERVAL_SECS {
+            self.flush_current_batch().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn flush_current_batch(&self) -> Result<()> {
+        let batch = {
+            let mut current_batch = self.current_batch.lock().await;
+            if current_batch.is_empty() {
+                return Ok(());
+            }
+            std::mem::replace(&mut *current_batch, Vec::with_capacity(FLUSH_BATCH_SIZE))
+        };
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let batch_size = batch.len();
+        let schema = self.build_schema();
+
+        let mut writer_lock = self.current_writer.lock().await;
+        let mut file_rows_lock = self.current_file_rows.lock().await;
+        let mut file_path_lock = self.current_file_path.lock().await;
+
+        // If no writer OR current file would exceed MAX_ROWS, close and start new file
+        if writer_lock.is_none() || (*file_rows_lock + batch_size) > MAX_ROWS_PER_FILE {
+             // Close current writer if exists
+            if let Some(writer) = writer_lock.take() {
+                writer.close()
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+
+                if let Some(path) = file_path_lock.take() {
+                    info!(
+                        "Closed parquet trade file {} with {} rows",
+                        path.display(),
+                        *file_rows_lock
+                    );
+                }
+                *file_rows_lock = 0;
+            }
+
+            // Generate filename for new file
+            let first_ts = batch[0].timestamp_ms;
+            let part_num = {
+                let mut counter = self.part_counter.lock().await;
+                let num = *counter;
+                *counter += 1;
+                num
+            };
+
+            // Format: part_TIMESTAMP_PART.parquet
+            let filename = format!("part_{:013}_{:06}.parquet", first_ts, part_num);
+            let file_path = self.parts_dir.join(&filename);
+
+            // Create new file and writer
+            let file = File::create(&file_path)?;
+            let props = WriterProperties::builder()
+                .set_compression(Compression::ZSTD(parquet::basic::ZstdLevel::try_new(3).unwrap()))
+                // Use very small row group size for trades since they arrive infrequently
+                // This ensures data is written to disk immediately instead of buffering
+                // Previous values (2000, 50) caused 0 KB files in Docker until shutdown
+                .set_max_row_group_size(10)
+                .build();
+
+            let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create writer: {}", e)))?;
+
+            *writer_lock = Some(new_writer);
+            *file_path_lock = Some(file_path.clone());
+            *file_rows_lock = 0;
+
+            info!("Created new parquet trade file: {}", filename);
+        }
+
+        // Write batch to current open file
+        let record_batch = self.build_record_batch(&batch, &schema)?;
+        let current_file_path = file_path_lock.clone();
+
+        if let Some(writer) = writer_lock.as_mut() {
+            writer.write(&record_batch)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to write batch: {}", e)))?;
+
+            writer.flush()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to flush writer: {}", e)))?;
+
+            *file_rows_lock += batch_size;
+
+            debug!(
+                "Wrote {} trades to current file (total: {}/{})",
+                batch_size,
+                *file_rows_lock,
+                MAX_ROWS_PER_FILE
+            );
+        }
+
+        // CRITICAL: Force sync to disk (fixes Docker volume buffering)
+        // ArrowWriter.flush() only flushes to OS buffer, not to disk
+        // This ensures data is visible in Docker volumes immediately
+        if let Some(path) = current_file_path {
+            if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                if let Err(e) = file.sync_data() {
+                    warn!("Failed to sync file to disk: {}", e);
+                }
+            }
+        }
+
+        // Update last flush time
+        *self.last_flush.lock().await = Instant::now();
+
+        Ok(())
+    }
+
+    fn build_schema(&self) -> Schema {
+        Schema::new(vec![
+            Field::new("timestamp_ms", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+            Field::new("price", DataType::Float64, false),
+            Field::new("quantity", DataType::Float64, false),
+            Field::new("is_buyer_maker", DataType::Boolean, false),
+        ])
+    }
+
+    fn build_record_batch(&self, batch: &[FlattenedTrade], schema: &Schema) -> Result<RecordBatch> {
+        let timestamps: Vec<i64> = batch.iter().map(|t| t.timestamp_ms).collect();
+        let prices: Vec<f64> = batch.iter().map(|t| t.price).collect();
+        let quantities: Vec<f64> = batch.iter().map(|t| t.quantity).collect();
+        let makers: Vec<bool> = batch.iter().map(|t| t.is_buyer_maker).collect();
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(TimestampMillisecondArray::from(timestamps)),
+            Arc::new(Float64Array::from(prices)),
+            Arc::new(Float64Array::from(quantities)),
+            Arc::new(BooleanArray::from(makers)),
+        ];
+
+        RecordBatch::try_new(Arc::new(schema.clone()), columns)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to create RecordBatch: {}", e)).into())
+    }
+
+    pub async fn get_stats(&self) -> (u64, Option<i64>, Option<u64>) {
+        let state = self.state.lock().await;
+        (state.trades_count, state.last_trade_id, state.last_trade_timestamp)
+    }
+
+    pub async fn save_state(&self) -> Result<()> {
+        self.flush_current_batch().await?;
+        let state = self.state.lock().await;
+        let state_path = self.parts_dir.parent().unwrap().join("state.json");
+        state.save_to_file(&state_path)?;
+        info!("Saved state for {}: {} trades", state.market, state.trades_count);
+        Ok(())
+    }
+
+    pub async fn close_writer(&self) -> Result<()> {
+        self.flush_current_batch().await?;
+        
+        let mut writer_lock = self.current_writer.lock().await;
+        if let Some(writer) = writer_lock.take() {
+            let file_rows = *self.current_file_rows.lock().await;
+            writer.close()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("Failed to close writer: {}", e)))?;
+            info!("Closed final parquet trade file with {} rows", file_rows);
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) -> Result<()> {
+        self.close_writer().await
+    }
+    
+    pub async fn force_flush(&self) -> Result<()> {
+        let elapsed_secs = self.last_flush.lock().await.elapsed().as_secs();
+        let batch_size = self.current_batch.lock().await.len();
+
+        debug!(
+            "Periodic flush check: {} seconds elapsed, {} trades pending",
+            elapsed_secs, batch_size
+        );
+
+        // Always flush if there's data, regardless of time elapsed
+        // This is more aggressive but ensures data is written in Docker
+        if batch_size > 0 {
+            debug!("Force flushing {} pending trades", batch_size);
+            self.flush_current_batch().await?;
+        }
+
         Ok(())
     }
 }

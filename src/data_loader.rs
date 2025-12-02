@@ -1,5 +1,5 @@
 use crate::model_types::TradeEvent;
-use arrow::array::{Array, Float64Array, TimestampMillisecondArray};
+use arrow::array::{Array, BooleanArray, Float64Array, TimestampMillisecondArray};
 use arrow::record_batch::RecordBatch;
 use csv::{ReaderBuilder, StringRecord};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -10,6 +10,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::iter::Peekable;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub enum DataEvent {
@@ -56,17 +57,29 @@ impl DataLoader {
 
     /// Load all trades into memory (backward compatibility)
     pub fn get_trades(&self) -> Result<Vec<TradeEvent>, Box<dyn Error>> {
-        let file = File::open(&self.trades_path)?;
-        let buf = std::io::BufReader::with_capacity(1024 * 1024, file);
-        let rdr = ReaderBuilder::new().from_reader(buf);
+        // Detect format
+        let use_parquet = self.trades_path.is_dir() ||
+                          self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
-        let mut trades = Vec::new();
-        for result in rdr.into_deserialize::<RawTrade>() {
-            let raw = result?;
-            trades.push(parse_trade(raw)?);
+        if use_parquet {
+            let mut trades = Vec::new();
+            let iter = ParquetTradeIterator::new(&self.trades_path)?;
+            for result in iter {
+                trades.push(result?);
+            }
+            Ok(trades)
+        } else {
+            let file = File::open(&self.trades_path)?;
+            let buf = std::io::BufReader::with_capacity(1024 * 1024, file);
+            let rdr = ReaderBuilder::new().from_reader(buf);
+
+            let mut trades = Vec::new();
+            for result in rdr.into_deserialize::<RawTrade>() {
+                let raw = result?;
+                trades.push(parse_trade(raw)?);
+            }
+            Ok(trades)
         }
-
-        Ok(trades)
     }
 
     /// Iterator over orderbook snapshots (backward compatibility)
@@ -99,53 +112,109 @@ impl DataLoader {
     }
 
     pub fn stream(&self) -> Result<MergedDataIterator, Box<dyn Error>> {
-        let trades_file = File::open(&self.trades_path)?;
-        // Use a large buffer (1MB) to read chunks from disk, improving performance
-        let trades_buf = std::io::BufReader::with_capacity(1024 * 1024, trades_file);
-        let trades_rdr = ReaderBuilder::new().from_reader(trades_buf);
-        let trades_iter = trades_rdr.into_deserialize::<RawTrade>();
+        // Setup Trade Source
+        let use_parquet_trades = self.trades_path.is_dir() ||
+                          self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
-        // Detect format: directory with Parquet files or CSV file
-        let use_parquet = self.orderbook_path.is_dir() ||
+        let trade_source = if use_parquet_trades {
+            let iter = ParquetTradeIterator::new(&self.trades_path)?;
+            TradeSource::Parquet(iter)
+        } else {
+            let trades_file = File::open(&self.trades_path)?;
+            let trades_buf = std::io::BufReader::with_capacity(1024 * 1024, trades_file);
+            let trades_rdr = ReaderBuilder::new().from_reader(trades_buf);
+            let trades_iter = trades_rdr.into_deserialize::<RawTrade>();
+            TradeSource::Csv(trades_iter.peekable())
+        };
+
+        // Setup Orderbook Source
+        let use_parquet_ob = self.orderbook_path.is_dir() ||
                           self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
-        if use_parquet {
-            // Read from Parquet files
+        let (orderbook_source, max_levels) = if use_parquet_ob {
             let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path)?;
-            let max_levels = parquet_iter.max_levels;
-
-            Ok(MergedDataIterator {
-                trades_iter: trades_iter.peekable(),
-                orderbook_source: OrderbookSource::Parquet(parquet_iter),
-                max_levels,
-                next_trade: None,
-                next_orderbook: None,
-            })
+            let max = parquet_iter.max_levels;
+            (OrderbookSource::Parquet(parquet_iter), max)
         } else {
-            // Read from CSV file
             let orderbook_file = File::open(&self.orderbook_path)?;
             let orderbook_buf = std::io::BufReader::with_capacity(1024 * 1024, orderbook_file);
             let mut orderbook_rdr = ReaderBuilder::new().from_reader(orderbook_buf);
 
-            // Get headers to determine depth
             let headers = orderbook_rdr.headers()?.clone();
-            let mut max_levels = 0;
+            let mut max = 0;
             for field in headers.iter() {
                 if field.starts_with("bid_price") {
-                    max_levels += 1;
+                    max += 1;
                 }
             }
 
             let orderbook_iter = orderbook_rdr.into_records();
+            (OrderbookSource::Csv(orderbook_iter.peekable()), max)
+        };
 
-            Ok(MergedDataIterator {
-                trades_iter: trades_iter.peekable(),
-                orderbook_source: OrderbookSource::Csv(orderbook_iter.peekable()),
-                max_levels,
-                next_trade: None,
-                next_orderbook: None,
-            })
+        Ok(MergedDataIterator {
+            trade_source,
+            orderbook_source,
+            max_levels,
+            next_trade: None,
+            next_orderbook: None,
+        })
+    }
+
+    /// Load all data events into memory for fast iteration, sorted by timestamp and deduplicated
+    pub fn load_all_events(&self) -> Result<Vec<DataEvent>, Box<dyn Error>> {
+        let stream = self.stream()?;
+        let mut events = Vec::with_capacity(100_000); // Reasonable initial guess
+        for event in stream {
+            events.push(event?);
         }
+
+        // 1. Sort by timestamp (stable sort to preserve relative order of same-timestamp events if needed)
+        events.sort_by_key(|e| e.timestamp());
+
+        // 2. Deduplicate trades
+        // Only removes trades that are EXACTLY identical (timestamp, price, qty, side)
+        // Does NOT remove different trades at the same timestamp.
+        let mut unique_events = Vec::with_capacity(events.len());
+        let mut seen_trades_at_ts: HashSet<(Decimal, Decimal, bool)> = HashSet::new();
+        let mut current_ts = 0;
+
+        for event in events {
+            match event {
+                DataEvent::Trade(ref t) => {
+                    if t.timestamp != current_ts {
+                        current_ts = t.timestamp;
+                        seen_trades_at_ts.clear();
+                    }
+
+                    // Create key for deduplication: (price, quantity, side)
+                    // Note: Decimal implements Hash and Eq
+                    let key = (t.price, t.quantity, t.is_buyer_maker);
+
+                    if seen_trades_at_ts.contains(&key) {
+                        // Duplicate found - skip
+                        continue;
+                    }
+
+                    seen_trades_at_ts.insert(key);
+                    unique_events.push(event);
+                }
+                DataEvent::Orderbook(_) => {
+                    // Always keep orderbook updates
+                    // Reset trades seen for this timestamp?
+                    // No, trades and orderbooks can be interleaved at the same millisecond.
+                    // The set logic handles duplicates within the same timestamp correctly regardless of interleaving orderbooks.
+                    // But if timestamp changes, we clear.
+                    if event.timestamp() != current_ts {
+                        current_ts = event.timestamp();
+                        seen_trades_at_ts.clear();
+                    }
+                    unique_events.push(event);
+                }
+            }
+        }
+
+        Ok(unique_events)
     }
 }
 
@@ -197,8 +266,13 @@ enum OrderbookSource {
     Parquet(ParquetOrderbookIterator),
 }
 
+enum TradeSource {
+    Csv(Peekable<csv::DeserializeRecordsIntoIter<std::io::BufReader<File>, RawTrade>>),
+    Parquet(ParquetTradeIterator),
+}
+
 pub struct MergedDataIterator {
-    trades_iter: Peekable<csv::DeserializeRecordsIntoIter<std::io::BufReader<File>, RawTrade>>,
+    trade_source: TradeSource,
     orderbook_source: OrderbookSource,
     max_levels: usize,
     // Buffers to hold the parsed next event to allow peeking/comparison
@@ -212,22 +286,33 @@ impl Iterator for MergedDataIterator {
     fn next(&mut self) -> Option<Self::Item> {
         // Ensure we have the next trade buffered if available
         if self.next_trade.is_none() {
-            match self.trades_iter.next() {
-                Some(Ok(raw)) => {
-                    match parse_trade(raw) {
-                        Ok(trade) => self.next_trade = Some(trade),
-                        Err(e) => return Some(Err(e)),
+            match &mut self.trade_source {
+                TradeSource::Csv(iter) => {
+                    match iter.next() {
+                        Some(Ok(raw)) => {
+                            match parse_trade(raw) {
+                                Ok(trade) => self.next_trade = Some(trade),
+                                Err(e) => return Some(Err(e)),
+                            }
+                        },
+                        Some(Err(e)) => return Some(Err(Box::new(e))),
+                        None => {} // End of trades
                     }
                 },
-                Some(Err(e)) => return Some(Err(Box::new(e))),
-                None => {} // End of trades
+                TradeSource::Parquet(iter) => {
+                    match iter.next() {
+                        Some(Ok(trade)) => self.next_trade = Some(trade),
+                        Some(Err(e)) => return Some(Err(e)),
+                        None => {}
+                    }
+                }
             }
         }
 
         // Ensure we have the next orderbook buffered if available
         if self.next_orderbook.is_none() {
             match &mut self.orderbook_source {
-                OrderbookSource::Csv(ref mut iter) => {
+                OrderbookSource::Csv(iter) => {
                     match iter.next() {
                         Some(Ok(record)) => {
                             match parse_orderbook(record, self.max_levels) {
@@ -239,7 +324,7 @@ impl Iterator for MergedDataIterator {
                         None => {} // End of orderbooks
                     }
                 },
-                OrderbookSource::Parquet(ref mut iter) => {
+                OrderbookSource::Parquet(iter) => {
                     match iter.next() {
                         Some(Ok(ob)) => self.next_orderbook = Some(ob),
                         Some(Err(e)) => return Some(Err(e)),
@@ -317,6 +402,165 @@ fn parse_orderbook(record: StringRecord, max_levels: usize) -> Result<OrderbookS
     })
 }
 
+/// Iterator over Parquet trade files
+pub struct ParquetTradeIterator {
+    files: Vec<PathBuf>,
+    current_file_idx: usize,
+    current_reader: Option<Box<dyn Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>>>,
+    current_batch: Option<RecordBatch>,
+    current_row_idx: usize,
+}
+
+impl ParquetTradeIterator {
+    pub fn new(path: &Path) -> Result<Self, Box<dyn Error>> {
+        let files = if path.is_dir() {
+            let mut files: Vec<PathBuf> = fs::read_dir(path)?
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("parquet"))
+                .collect();
+            files.sort();
+            files
+        } else {
+            vec![path.to_path_buf()]
+        };
+
+        if files.is_empty() {
+            return Err("No Parquet trade files found".into());
+        }
+
+        let mut iter = Self {
+            files,
+            current_file_idx: 0,
+            current_reader: None,
+            current_batch: None,
+            current_row_idx: 0,
+        };
+
+        iter.advance_file()?;
+        Ok(iter)
+    }
+
+    fn advance_file(&mut self) -> Result<bool, Box<dyn Error>> {
+        loop {
+            if self.current_file_idx >= self.files.len() {
+                return Ok(false);
+            }
+
+            let file_path = &self.files[self.current_file_idx];
+            self.current_file_idx += 1;
+
+            match File::open(file_path) {
+                Ok(file) => {
+                    match ParquetRecordBatchReaderBuilder::try_new(file) {
+                        Ok(builder) => {
+                            match builder.build() {
+                                Ok(reader) => {
+                                    self.current_reader = Some(Box::new(reader));
+                                    self.current_batch = None;
+                                    self.current_row_idx = 0;
+                                    return Ok(true);
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Warning: Skipping unreadable parquet file {:?}: {}", file_path, e);
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn read_trade_from_batch(&self, batch: &RecordBatch, row_idx: usize) -> Result<TradeEvent, Box<dyn Error>> {
+        let timestamp_col = batch.column_by_name("timestamp_ms")
+            .ok_or("Missing timestamp_ms column")?
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .ok_or("Invalid timestamp column type")?;
+        
+        let price_col = batch.column_by_name("price")
+            .ok_or("Missing price column")?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or("Invalid price column type")?;
+            
+        let quantity_col = batch.column_by_name("quantity")
+            .ok_or("Missing quantity column")?
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or("Invalid quantity column type")?;
+            
+        let maker_col = batch.column_by_name("is_buyer_maker")
+            .ok_or("Missing is_buyer_maker column")?
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or("Invalid is_buyer_maker column type")?;
+
+        let timestamp = timestamp_col.value(row_idx) as u64;
+        let price = Decimal::from_f64(price_col.value(row_idx)).ok_or("Invalid price value")?;
+        let quantity = Decimal::from_f64(quantity_col.value(row_idx)).ok_or("Invalid quantity value")?;
+        let is_buyer_maker = maker_col.value(row_idx);
+
+        Ok(TradeEvent {
+            timestamp,
+            price,
+            quantity,
+            is_buyer_maker,
+        })
+    }
+}
+
+impl Iterator for ParquetTradeIterator {
+    type Item = Result<TradeEvent, Box<dyn Error>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(ref batch) = self.current_batch {
+                if self.current_row_idx < batch.num_rows() {
+                    let trade = self.read_trade_from_batch(batch, self.current_row_idx);
+                    self.current_row_idx += 1;
+                    return Some(trade);
+                } else {
+                    self.current_batch = None;
+                    self.current_row_idx = 0;
+                }
+            }
+
+            if let Some(ref mut reader) = self.current_reader {
+                match reader.next() {
+                    Some(Ok(batch)) => {
+                        self.current_batch = Some(batch);
+                        self.current_row_idx = 0;
+                        continue;
+                    }
+                    Some(Err(e)) => return Some(Err(Box::new(e))),
+                    None => {
+                        self.current_reader = None;
+                    }
+                }
+            }
+
+            if self.current_reader.is_none() {
+                match self.advance_file() {
+                    Ok(true) => continue,
+                    Ok(false) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+        }
+    }
+}
+
 /// Iterator over Parquet orderbook files
 pub struct ParquetOrderbookIterator {
     files: Vec<PathBuf>,
@@ -324,7 +568,7 @@ pub struct ParquetOrderbookIterator {
     current_reader: Option<Box<dyn Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>>>,
     current_batch: Option<RecordBatch>,
     current_row_idx: usize,
-    max_levels: usize,
+    pub max_levels: usize, // Made public to access from stream()
 }
 
 impl ParquetOrderbookIterator {
