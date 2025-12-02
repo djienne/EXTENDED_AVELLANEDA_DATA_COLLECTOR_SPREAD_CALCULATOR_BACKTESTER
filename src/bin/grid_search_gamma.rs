@@ -26,7 +26,7 @@ use std::time::Instant;
 // =============================================================================
 
 const DEFAULT_CONFIG_PATH: &str = "config.json";
-const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades.csv";
+const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades_parts";
 const DEFAULT_ORDERBOOK_PATH: &str = "data/eth_usd/orderbook_parts";
 const DEFAULT_OUTPUT_PATH: &str = "data/eth_usd/grid_search_2d_results.csv";
 
