@@ -4,9 +4,11 @@
 /// of prices and trades, and performs periodic recalibration of volatility (σ) and
 /// intensity parameters (κ, A).
 
-use crate::calibration::{calculate_volatility, fit_intensity_parameters};
+use crate::calibration::{calculate_volatility, fit_intensity_parameters, OrderbookPoint};
+use crate::data_loader::OrderbookSnapshot;
 use crate::model_types::{ASConfig, TradeEvent};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::*;
 
 /// Minimum number of price observations required for calibration
 const MIN_PRICES_FOR_CALIBRATION: usize = 10;
@@ -34,6 +36,8 @@ pub struct CalibrationResult {
 pub struct CalibrationEngine {
     /// Rolling window of prices for volatility calculation (timestamp, price)
     calibration_prices: Vec<(u64, Decimal)>,
+    /// Rolling window of orderbook exposure points for intensity fitting
+    orderbook_points: Vec<OrderbookPoint>,
     /// Rolling window of trades for intensity parameter fitting
     window_trades: Vec<TradeEvent>,
     /// Current kappa parameter for bid side
@@ -65,6 +69,7 @@ impl CalibrationEngine {
 
         Self {
             calibration_prices: Vec::with_capacity(estimated_prices),
+            orderbook_points: Vec::with_capacity(estimated_prices),
             window_trades: Vec::with_capacity(estimated_trades),
             bid_kappa: 10.0,  // Default starting value
             bid_a: 100.0,     // Default starting value
@@ -82,6 +87,44 @@ impl CalibrationEngine {
         self.calibration_prices.push((timestamp, price));
     }
 
+    /// Add a full orderbook snapshot to the calibration window (captures exposure and mid)
+    #[inline]
+    pub fn add_orderbook(&mut self, snapshot: &OrderbookSnapshot, mid_price: Decimal) {
+        let timestamp = snapshot.timestamp;
+        self.calibration_prices.push((timestamp, mid_price));
+
+        let best_bid = snapshot.bids.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
+        let best_ask = snapshot.asks.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
+        let far_bid = snapshot.bids.last().map(|(p, _)| *p).unwrap_or(best_bid);
+        let far_ask = snapshot.asks.last().map(|(p, _)| *p).unwrap_or(best_ask);
+
+        let bid_min = (mid_price - best_bid)
+            .max(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let bid_max = (mid_price - far_bid)
+            .max(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let ask_min = (best_ask - mid_price)
+            .max(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+        let ask_max = (far_ask - mid_price)
+            .max(Decimal::ZERO)
+            .to_f64()
+            .unwrap_or(0.0);
+
+        self.orderbook_points.push(OrderbookPoint {
+            timestamp,
+            mid: mid_price,
+            bid_min,
+            bid_max,
+            ask_min,
+            ask_max,
+        });
+    }
+
     /// Add a trade to the calibration window
     /// 
     /// Note: Takes ownership of the trade. Clone before calling if you need to retain it.
@@ -95,6 +138,11 @@ impl CalibrationEngine {
         // Remove prices older than calibration window
         self.calibration_prices.retain(|(ts, _)| {
             current_ts.saturating_sub(*ts) <= self.calibration_window_ms
+        });
+
+        // Remove orderbooks older than calibration window
+        self.orderbook_points.retain(|p| {
+            current_ts.saturating_sub(p.timestamp) <= self.calibration_window_ms
         });
 
         // Remove trades older than calibration window
@@ -127,7 +175,7 @@ impl CalibrationEngine {
     pub fn calibrate(
         &mut self,
         current_ts: u64,
-        tick_size: f64,
+        _tick_size: f64,
     ) -> Option<CalibrationResult> {
         if self.calibration_prices.is_empty() {
             return None;
@@ -146,9 +194,8 @@ impl CalibrationEngine {
         // Fit intensity parameters (returns separate bid/ask values)
         let (new_bid_kappa, new_bid_a, new_ask_kappa, new_ask_a) = fit_intensity_parameters(
             &self.window_trades,
-            &self.calibration_prices,
-            actual_duration_sec,
-            tick_size,
+            &self.orderbook_points,
+            current_ts,
         );
 
         // Update stored parameters if valid
@@ -219,6 +266,7 @@ impl CalibrationEngine {
     /// Reset the engine state (useful for reusing across multiple backtests)
     pub fn reset(&mut self) {
         self.calibration_prices.clear();
+        self.orderbook_points.clear();
         self.window_trades.clear();
         self.bid_kappa = 10.0;
         self.bid_a = 100.0;
