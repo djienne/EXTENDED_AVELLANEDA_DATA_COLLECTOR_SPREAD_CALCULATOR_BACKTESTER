@@ -9,7 +9,7 @@ use std::path::Path;
 const DEFAULT_INITIAL_CAPITAL: i64 = 1000;
 const DEFAULT_ORDER_NOTIONAL: i64 = 20;
 const DEFAULT_CONFIG_PATH: &str = "config.json";
-const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades.csv";
+const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades_parts";
 const DEFAULT_ORDERBOOK_PATH: &str = "data/eth_usd/orderbook_parts";
 const DEFAULT_OUTPUT_PATH: &str = "data/eth_usd/backtest_results.csv";
 
