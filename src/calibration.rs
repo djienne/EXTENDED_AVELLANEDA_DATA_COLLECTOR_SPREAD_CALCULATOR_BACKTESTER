@@ -18,6 +18,29 @@ const DEFAULT_KAPPA: f64 = 10.0;
 /// Default A when calibration fails
 const DEFAULT_A: f64 = 10.0;
 
+/// Lower/upper bounds for kappa grid search
+const KAPPA_MIN: f64 = 1e-6;
+const KAPPA_MAX: f64 = 1e4;
+
+/// Exposure over a single orderbook interval for one side
+#[derive(Debug, Clone)]
+struct ExposureInterval {
+    duration_sec: f64,
+    delta_min: f64,
+    delta_max: f64,
+}
+
+/// Minimal orderbook information needed for intensity calibration
+#[derive(Debug, Clone)]
+pub struct OrderbookPoint {
+    pub timestamp: u64,
+    pub mid: Decimal,
+    pub bid_min: f64,
+    pub bid_max: f64,
+    pub ask_min: f64,
+    pub ask_max: f64,
+}
+
 // ============================================================================
 // Volatility Calculation
 // ============================================================================
@@ -84,126 +107,249 @@ pub fn calculate_volatility(
 // Intensity Parameter Fitting
 // ============================================================================
 
-/// Estimate intensity parameters kappa and A using Maximum Likelihood Estimation (MLE)
-/// assuming a Poisson process with exponential intensity decay.
+/// Estimate intensity parameters kappa and A using a truncated exponential MLE.
 ///
-/// Model: λ(δ) = A * exp(-κ * δ)
-/// MLE Estimators:
-///   κ = 1 / mean(δ)
-///   A = (N * κ) / T
-/// where N is number of trades and T is window duration.
-fn estimate_mle_side(
-    deltas: &[f64],
-    window_duration_seconds: f64,
-) -> Option<(f64, f64)> {
-    if deltas.len() < MIN_TRADES_FOR_ESTIMATION || window_duration_seconds <= 0.0 {
-        return None;
-    }
+/// Combines trade deltas with per-snapshot exposure (delta_min, delta_max, duration)
+/// to account for the part of the book that could realistically fill.
 
-    let n = deltas.len() as f64;
-    let sum_deltas: f64 = deltas.iter().sum();
-    
-    if sum_deltas <= 0.0 {
-        return None;
-    }
-
-    let mean_delta = sum_deltas / n;
-    
-    // MLE for Exponential distribution parameter (beta = 1/lambda in some notations, here kappa)
-    // If P(delta) ~ exp(-kappa * delta), then kappa = 1 / mean(delta)
-    let kappa = 1.0 / mean_delta;
-
-    // MLE for A involves the total count N over time T
-    // N ~ Poisson(integral(lambda(delta)) * T)
-    // integral_0_inf A*exp(-k*d) dd = A/k
-    // E[N] = (A/k) * T
-    // A = (N * k) / T
-    let a = (n * kappa) / window_duration_seconds;
-
-    // Validate results
-    if !kappa.is_finite() || !a.is_finite() || kappa <= 0.0 || a <= 0.0 {
-        return None;
-    }
-
-    Some((kappa, a))
-}
-
-/// Find the mid-price index for a given timestamp using binary search
-/// Returns the index of the last mid-price with timestamp <= target
+/// Find the orderbook index for a given timestamp using a forward scan from a hint
+/// Returns the index of the last orderbook with timestamp <= target
 #[inline]
-fn find_mid_price_index(mid_prices: &[(u64, Decimal)], target_ts: u64, hint: usize) -> usize {
-    // Start from hint and scan forward (common case: timestamps are roughly in order)
+fn find_orderbook_index(points: &[OrderbookPoint], target_ts: u64, hint: usize) -> usize {
     let mut idx = hint;
     
-    while idx + 1 < mid_prices.len() && mid_prices[idx + 1].0 <= target_ts {
+    while idx + 1 < points.len() && points[idx + 1].timestamp <= target_ts {
         idx += 1;
     }
     
     idx
 }
 
+/// Build exposure intervals for one side using successive orderbook points.
+/// Each interval covers the time until the next snapshot (or window end).
+fn build_side_exposures(
+    orderbooks: &[OrderbookPoint],
+    window_end_ts: u64,
+    is_bid: bool,
+) -> Vec<ExposureInterval> {
+    let mut exposures = Vec::new();
+
+    for (idx, ob) in orderbooks.iter().enumerate() {
+        let start_ts = ob.timestamp;
+        let end_ts = if idx + 1 < orderbooks.len() {
+            orderbooks[idx + 1].timestamp
+        } else {
+            window_end_ts
+        };
+
+        if end_ts <= start_ts {
+            continue;
+        }
+
+        let duration_sec = (end_ts.saturating_sub(start_ts)) as f64 / 1000.0;
+        if duration_sec <= 0.0 {
+            continue;
+        }
+
+        let (delta_min, delta_max) = if is_bid {
+            (ob.bid_min, ob.bid_max)
+        } else {
+            (ob.ask_min, ob.ask_max)
+        };
+
+        if !delta_min.is_finite() || !delta_max.is_finite() || delta_max <= delta_min || delta_max <= 0.0 {
+            continue;
+        }
+
+        exposures.push(ExposureInterval {
+            duration_sec,
+            delta_min,
+            delta_max,
+        });
+    }
+
+    exposures
+}
+
+/// Collect trade deltas for a given side using the most recent orderbook point at each trade time.
+fn collect_trade_deltas(
+    trades: &[TradeEvent],
+    orderbooks: &[OrderbookPoint],
+    is_bid: bool,
+) -> Vec<f64> {
+    if orderbooks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut deltas = Vec::with_capacity(trades.len());
+    let mut ob_idx = 0;
+
+    for trade in trades {
+        if is_bid && !trade.is_buyer_maker {
+            continue;
+        }
+        if !is_bid && trade.is_buyer_maker {
+            continue;
+        }
+
+        ob_idx = find_orderbook_index(orderbooks, trade.timestamp, ob_idx);
+        let ob = &orderbooks[ob_idx];
+
+        let delta_dec = if is_bid {
+            ob.mid - trade.price
+        } else {
+            trade.price - ob.mid
+        };
+
+        if delta_dec <= Decimal::ZERO {
+            continue;
+        }
+
+        if let Some(delta) = delta_dec.to_f64() {
+            if delta.is_finite() && delta > 0.0 {
+                deltas.push(delta);
+            }
+        }
+    }
+
+    deltas
+}
+
+#[inline]
+fn exposure_term(kappa: f64, exposures: &[ExposureInterval]) -> f64 {
+    exposures
+        .iter()
+        .map(|e| {
+            let upper = (-kappa * e.delta_max).exp();
+            let lower = (-kappa * e.delta_min).exp();
+            e.duration_sec * (lower - upper)
+        })
+        .sum()
+}
+
+fn log_likelihood(
+    kappa: f64,
+    n: f64,
+    sum_deltas: f64,
+    exposures: &[ExposureInterval],
+) -> f64 {
+    if kappa <= 0.0 || !kappa.is_finite() || exposures.is_empty() || n <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+
+    let exposure = exposure_term(kappa, exposures);
+    if !exposure.is_finite() || exposure <= 0.0 {
+        return f64::NEG_INFINITY;
+    }
+
+    // Log-likelihood up to additive constant: n*(ln k - ln exposure) - k*sum_delta
+    n * (kappa.ln() - exposure.ln()) - kappa * sum_deltas
+}
+
+fn estimate_mle_side_exposure(
+    deltas: &[f64],
+    exposures: &[ExposureInterval],
+) -> Option<(f64, f64)> {
+    if deltas.len() < MIN_TRADES_FOR_ESTIMATION || exposures.is_empty() {
+        return None;
+    }
+
+    let n = deltas.len() as f64;
+    let sum_deltas: f64 = deltas.iter().sum();
+    if sum_deltas <= 0.0 || !sum_deltas.is_finite() {
+        return None;
+    }
+
+    // Coarse log-space search to bracket a good region
+    let mut best_kappa = None;
+    let mut best_ll = f64::NEG_INFINITY;
+    let log_min = KAPPA_MIN.log10();
+    let log_max = KAPPA_MAX.log10();
+
+    for i in 0..=60 {
+        let frac = i as f64 / 60.0;
+        let kappa = 10f64.powf(log_min + frac * (log_max - log_min));
+        let ll = log_likelihood(kappa, n, sum_deltas, exposures);
+        if ll.is_finite() && ll > best_ll {
+            best_ll = ll;
+            best_kappa = Some(kappa);
+        }
+    }
+
+    let mut best_kappa = best_kappa?;
+    // Refine with golden-section search around the best coarse point
+    let mut low = (best_kappa / 5.0).max(KAPPA_MIN);
+    let mut high = (best_kappa * 5.0).min(KAPPA_MAX);
+    if high <= low {
+        high = (low * 10.0).min(KAPPA_MAX);
+    }
+
+    const PHI: f64 = 0.618_033_988_75; // golden ratio conjugate
+    let mut c = high - (high - low) * PHI;
+    let mut d = low + (high - low) * PHI;
+    let mut fc = log_likelihood(c, n, sum_deltas, exposures);
+    let mut fd = log_likelihood(d, n, sum_deltas, exposures);
+
+    for _ in 0..32 {
+        if fc > fd {
+            high = d;
+            d = c;
+            fd = fc;
+            c = high - (high - low) * PHI;
+            fc = log_likelihood(c, n, sum_deltas, exposures);
+        } else {
+            low = c;
+            c = d;
+            fc = fd;
+            d = low + (high - low) * PHI;
+            fd = log_likelihood(d, n, sum_deltas, exposures);
+        }
+    }
+
+    best_kappa = if fc > fd { c } else { d };
+
+    let exposure = exposure_term(best_kappa, exposures);
+    if !exposure.is_finite() || exposure <= 0.0 {
+        return None;
+    }
+
+    let a = (n * best_kappa) / exposure;
+    if !a.is_finite() || a <= 0.0 || !best_kappa.is_finite() || best_kappa <= 0.0 {
+        return None;
+    }
+
+    Some((best_kappa, a))
+}
+
 /// Calibrates intensity parameters A and kappa using MLE on trade arrival rates
 ///
 /// # Arguments
 /// * `trades` - List of trades in the window
-/// * `mid_prices` - History of mid-prices (timestamp, price) sorted by timestamp
-/// * `window_duration_seconds` - The duration of the window in seconds
-/// * `tick_size` - Ignored by MLE (retained for API compatibility)
+/// * `orderbooks` - Rolling orderbook points (timestamp, deltas) sorted by timestamp
+/// * `window_end_ts` - End timestamp (ms) of the calibration window
 ///
 /// # Returns
 /// Tuple of (bid_kappa, bid_a, ask_kappa, ask_a) parameters
 pub fn fit_intensity_parameters(
     trades: &[TradeEvent],
-    mid_prices: &[(u64, Decimal)],
-    window_duration_seconds: f64,
-    _tick_size: f64,
+    orderbooks: &[OrderbookPoint],
+    window_end_ts: u64,
 ) -> (f64, f64, f64, f64) {
-    if trades.is_empty() || mid_prices.is_empty() || window_duration_seconds <= 0.0 {
+    if trades.is_empty() || orderbooks.is_empty() {
         return (DEFAULT_KAPPA, DEFAULT_A, DEFAULT_KAPPA, DEFAULT_A);
     }
 
-    // Pre-allocate with reasonable estimates
-    let estimated_per_side = trades.len() / 2;
-    let mut bid_deltas = Vec::with_capacity(estimated_per_side);
-    let mut ask_deltas = Vec::with_capacity(estimated_per_side);
+    // Collect trade deltas by side using the most recent book state
+    let bid_deltas = collect_trade_deltas(trades, orderbooks, true);
+    let ask_deltas = collect_trade_deltas(trades, orderbooks, false);
 
-    let mut mid_idx = 0;
-
-    for trade in trades {
-        // Find the appropriate mid-price for this trade's timestamp
-        mid_idx = find_mid_price_index(mid_prices, trade.timestamp, mid_idx);
-
-        let mid = mid_prices[mid_idx].1;
-        let price = trade.price;
-
-        if trade.is_buyer_maker {
-            // Buyer is maker = sell market order hit the bid
-            // Delta = how far below mid the trade occurred
-            let delta = mid - price;
-            if delta > Decimal::ZERO {
-                if let Some(d) = delta.to_f64() {
-                    if d.is_finite() && d > 0.0 {
-                        bid_deltas.push(d);
-                    }
-                }
-            }
-        } else {
-            // Seller is maker = buy market order hit the ask
-            // Delta = how far above mid the trade occurred
-            let delta = price - mid;
-            if delta > Decimal::ZERO {
-                if let Some(d) = delta.to_f64() {
-                    if d.is_finite() && d > 0.0 {
-                        ask_deltas.push(d);
-                    }
-                }
-            }
-        }
-    }
+    // Build exposure integrals for each side
+    let bid_exposures = build_side_exposures(orderbooks, window_end_ts, true);
+    let ask_exposures = build_side_exposures(orderbooks, window_end_ts, false);
 
     // Fit both sides separately
-    let bid_fit = estimate_mle_side(&bid_deltas, window_duration_seconds);
-    let ask_fit = estimate_mle_side(&ask_deltas, window_duration_seconds);
+    let bid_fit = estimate_mle_side_exposure(&bid_deltas, &bid_exposures);
+    let ask_fit = estimate_mle_side_exposure(&ask_deltas, &ask_exposures);
 
     // Return side-specific results (no averaging)
     match (bid_fit, ask_fit) {
@@ -274,8 +420,52 @@ mod tests {
 
     #[test]
     fn test_fit_intensity_empty() {
-        let result = fit_intensity_parameters(&[], &[], 100.0, 0.01);
+        let result = fit_intensity_parameters(&[], &[], 1000);
         assert_eq!(result, (DEFAULT_KAPPA, DEFAULT_A, DEFAULT_KAPPA, DEFAULT_A));
+    }
+
+    #[test]
+    fn test_fit_intensity_with_exposure() {
+        // Build synthetic trades hitting both sides
+        let mut trades = Vec::new();
+        for i in 0..5 {
+            trades.push(TradeEvent {
+                timestamp: 1_000 + i * 200,
+                price: Decimal::from_str("99.9").unwrap(),
+                quantity: Decimal::ONE,
+                is_buyer_maker: true, // hits bid
+            });
+            trades.push(TradeEvent {
+                timestamp: 2_000 + i * 200,
+                price: Decimal::from_str("100.1").unwrap(),
+                quantity: Decimal::ONE,
+                is_buyer_maker: false, // hits ask
+            });
+        }
+
+        // Two orderbook snapshots covering the window
+        let orderbooks = vec![
+            OrderbookPoint {
+                timestamp: 0,
+                mid: Decimal::from_str("100").unwrap(),
+                bid_min: 0.05,
+                bid_max: 1.0,
+                ask_min: 0.05,
+                ask_max: 1.0,
+            },
+            OrderbookPoint {
+                timestamp: 4_000,
+                mid: Decimal::from_str("100").unwrap(),
+                bid_min: 0.04,
+                bid_max: 0.8,
+                ask_min: 0.04,
+                ask_max: 0.8,
+            },
+        ];
+
+        let (bid_k, bid_a, ask_k, ask_a) = fit_intensity_parameters(&trades, &orderbooks, 5_000);
+        assert!(bid_k > 0.0 && bid_a > 0.0);
+        assert!(ask_k > 0.0 && ask_a > 0.0);
     }
 
     #[test]

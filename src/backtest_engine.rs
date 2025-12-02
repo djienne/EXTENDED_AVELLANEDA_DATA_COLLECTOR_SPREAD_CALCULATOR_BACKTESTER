@@ -348,7 +348,7 @@ where
                 last_mid = mid_price;
 
                 // Calibration & Quoting for NEXT interval
-                calibration_engine.add_price(current_ts, mid_price);
+                calibration_engine.add_orderbook(&quote, mid_price);
                 calibration_engine.prune_windows(current_ts);
 
                 // Check if we should recalibrate

@@ -138,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             last_quote = Some(quote);
 
             // Add price to calibration engine
-            calibration_engine.add_price(current_ts, quote.mid);
+            calibration_engine.add_orderbook(&snapshot, quote.mid);
 
             // Add trades that occurred since last update
             while trade_idx < all_trades.len() && all_trades[trade_idx].timestamp <= current_ts {
