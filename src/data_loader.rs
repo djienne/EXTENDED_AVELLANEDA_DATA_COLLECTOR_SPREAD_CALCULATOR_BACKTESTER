@@ -1,16 +1,17 @@
 use crate::model_types::TradeEvent;
 use arrow::array::{Array, BooleanArray, Float64Array, TimestampMillisecondArray};
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use csv::{ReaderBuilder, StringRecord};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
+use rust_decimal::Decimal;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::error::Error;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
 use std::iter::Peekable;
-use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub enum DataEvent {
@@ -58,8 +59,8 @@ impl DataLoader {
     /// Load all trades into memory (backward compatibility)
     pub fn get_trades(&self) -> Result<Vec<TradeEvent>, Box<dyn Error>> {
         // Detect format
-        let use_parquet = self.trades_path.is_dir() ||
-                          self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
+        let use_parquet = self.trades_path.is_dir()
+            || self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         if use_parquet {
             let mut trades = Vec::new();
@@ -85,8 +86,8 @@ impl DataLoader {
     /// Iterator over orderbook snapshots (backward compatibility)
     pub fn orderbooks_iter(&self) -> Result<OrderbookIterator, Box<dyn Error>> {
         // Detect format
-        let use_parquet = self.orderbook_path.is_dir() ||
-                          self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
+        let use_parquet = self.orderbook_path.is_dir()
+            || self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         if use_parquet {
             let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path)?;
@@ -113,8 +114,8 @@ impl DataLoader {
 
     pub fn stream(&self) -> Result<MergedDataIterator, Box<dyn Error>> {
         // Setup Trade Source
-        let use_parquet_trades = self.trades_path.is_dir() ||
-                          self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
+        let use_parquet_trades = self.trades_path.is_dir()
+            || self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         let trade_source = if use_parquet_trades {
             let iter = ParquetTradeIterator::new(&self.trades_path)?;
@@ -128,8 +129,8 @@ impl DataLoader {
         };
 
         // Setup Orderbook Source
-        let use_parquet_ob = self.orderbook_path.is_dir() ||
-                          self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
+        let use_parquet_ob = self.orderbook_path.is_dir()
+            || self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         let (orderbook_source, max_levels) = if use_parquet_ob {
             let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path)?;
@@ -232,31 +233,25 @@ impl Iterator for OrderbookIterator {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            OrderbookIterator::Csv { iter, max_levels } => {
-                match iter.next() {
-                    Some(Ok(record)) => {
-                        match parse_orderbook(record, *max_levels) {
-                            Ok(snapshot) => {
-                                let ts = snapshot.timestamp;
-                                Some(Ok((ts, snapshot)))
-                            }
-                            Err(e) => Some(Err(e)),
-                        }
-                    }
-                    Some(Err(e)) => Some(Err(Box::new(e))),
-                    None => None,
-                }
-            }
-            OrderbookIterator::Parquet(iter) => {
-                match iter.next() {
-                    Some(Ok(snapshot)) => {
+            OrderbookIterator::Csv { iter, max_levels } => match iter.next() {
+                Some(Ok(record)) => match parse_orderbook(record, *max_levels) {
+                    Ok(snapshot) => {
                         let ts = snapshot.timestamp;
                         Some(Ok((ts, snapshot)))
                     }
-                    Some(Err(e)) => Some(Err(e)),
-                    None => None,
+                    Err(e) => Some(Err(e)),
+                },
+                Some(Err(e)) => Some(Err(Box::new(e))),
+                None => None,
+            },
+            OrderbookIterator::Parquet(iter) => match iter.next() {
+                Some(Ok(snapshot)) => {
+                    let ts = snapshot.timestamp;
+                    Some(Ok((ts, snapshot)))
                 }
-            }
+                Some(Err(e)) => Some(Err(e)),
+                None => None,
+            },
         }
     }
 }
@@ -289,23 +284,19 @@ impl Iterator for MergedDataIterator {
             match &mut self.trade_source {
                 TradeSource::Csv(iter) => {
                     match iter.next() {
-                        Some(Ok(raw)) => {
-                            match parse_trade(raw) {
-                                Ok(trade) => self.next_trade = Some(trade),
-                                Err(e) => return Some(Err(e)),
-                            }
+                        Some(Ok(raw)) => match parse_trade(raw) {
+                            Ok(trade) => self.next_trade = Some(trade),
+                            Err(e) => return Some(Err(e)),
                         },
                         Some(Err(e)) => return Some(Err(Box::new(e))),
                         None => {} // End of trades
                     }
-                },
-                TradeSource::Parquet(iter) => {
-                    match iter.next() {
-                        Some(Ok(trade)) => self.next_trade = Some(trade),
-                        Some(Err(e)) => return Some(Err(e)),
-                        None => {}
-                    }
                 }
+                TradeSource::Parquet(iter) => match iter.next() {
+                    Some(Ok(trade)) => self.next_trade = Some(trade),
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => {}
+                },
             }
         }
 
@@ -314,16 +305,14 @@ impl Iterator for MergedDataIterator {
             match &mut self.orderbook_source {
                 OrderbookSource::Csv(iter) => {
                     match iter.next() {
-                        Some(Ok(record)) => {
-                            match parse_orderbook(record, self.max_levels) {
-                                Ok(ob) => self.next_orderbook = Some(ob),
-                                Err(e) => return Some(Err(e)),
-                            }
+                        Some(Ok(record)) => match parse_orderbook(record, self.max_levels) {
+                            Ok(ob) => self.next_orderbook = Some(ob),
+                            Err(e) => return Some(Err(e)),
                         },
                         Some(Err(e)) => return Some(Err(Box::new(e))),
                         None => {} // End of orderbooks
                     }
-                },
+                }
                 OrderbookSource::Parquet(iter) => {
                     match iter.next() {
                         Some(Ok(ob)) => self.next_orderbook = Some(ob),
@@ -344,15 +333,15 @@ impl Iterator for MergedDataIterator {
                     let ob = self.next_orderbook.take().unwrap();
                     Some(Ok(DataEvent::Orderbook(ob)))
                 }
-            },
+            }
             (Some(_), None) => {
                 let trade = self.next_trade.take().unwrap();
                 Some(Ok(DataEvent::Trade(trade)))
-            },
+            }
             (None, Some(_)) => {
                 let ob = self.next_orderbook.take().unwrap();
                 Some(Ok(DataEvent::Orderbook(ob)))
-            },
+            }
             (None, None) => None,
         }
     }
@@ -371,7 +360,10 @@ fn parse_trade(raw: RawTrade) -> Result<TradeEvent, Box<dyn Error>> {
     })
 }
 
-fn parse_orderbook(record: StringRecord, max_levels: usize) -> Result<OrderbookSnapshot, Box<dyn Error>> {
+fn parse_orderbook(
+    record: StringRecord,
+    max_levels: usize,
+) -> Result<OrderbookSnapshot, Box<dyn Error>> {
     let timestamp: u64 = record[0].parse()?;
     let mut bids = Vec::new();
     let mut asks = Vec::new();
@@ -400,6 +392,88 @@ fn parse_orderbook(record: StringRecord, max_levels: usize) -> Result<OrderbookS
         bids,
         asks,
     })
+}
+
+fn validate_trade_schema(schema: &arrow::datatypes::Schema) -> Result<(), String> {
+    let expected = [
+        (
+            "timestamp_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("price", DataType::Float64),
+        ("quantity", DataType::Float64),
+        ("is_buyer_maker", DataType::Boolean),
+    ];
+
+    for (name, ty) in expected.iter() {
+        let field = schema
+            .field_with_name(name)
+            .map_err(|_| format!("Missing {} column", name))?;
+        if field.data_type() != ty {
+            return Err(format!(
+                "Invalid type for {}: expected {:?}, got {:?}",
+                name,
+                ty,
+                field.data_type()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_orderbook_schema(
+    schema: &arrow::datatypes::Schema,
+    max_levels: usize,
+) -> Result<(), String> {
+    if max_levels == 0 {
+        return Err("Orderbook schema must include at least one level".to_string());
+    }
+
+    let base_fields = [
+        (
+            "timestamp_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+        ),
+        ("market", DataType::Utf8),
+        ("seq", DataType::Int64),
+    ];
+
+    for (name, ty) in base_fields.iter() {
+        let field = schema
+            .field_with_name(name)
+            .map_err(|_| format!("Missing {} column", name))?;
+        if field.data_type() != ty {
+            return Err(format!(
+                "Invalid type for {}: expected {:?}, got {:?}",
+                name,
+                ty,
+                field.data_type()
+            ));
+        }
+    }
+
+    for level in 0..max_levels {
+        let bid_price = format!("bid_price_{}", level);
+        let bid_qty = format!("bid_qty_{}", level);
+        let ask_price = format!("ask_price_{}", level);
+        let ask_qty = format!("ask_qty_{}", level);
+
+        for name in [&bid_price, &bid_qty, &ask_price, &ask_qty] {
+            let field = schema
+                .field_with_name(name)
+                .map_err(|_| format!("Missing {} column", name))?;
+            if field.data_type() != &DataType::Float64 {
+                return Err(format!(
+                    "Invalid type for {}: expected Float64, got {:?}",
+                    name,
+                    field.data_type()
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Iterator over Parquet trade files
@@ -438,6 +512,9 @@ impl ParquetTradeIterator {
         };
 
         iter.advance_file()?;
+        if iter.current_reader.is_none() {
+            return Err("No valid Parquet trade files found".into());
+        }
         Ok(iter)
     }
 
@@ -451,56 +528,75 @@ impl ParquetTradeIterator {
             self.current_file_idx += 1;
 
             match File::open(file_path) {
-                Ok(file) => {
-                    match ParquetRecordBatchReaderBuilder::try_new(file) {
-                        Ok(builder) => {
-                            match builder.build() {
-                                Ok(reader) => {
-                                    self.current_reader = Some(Box::new(reader));
-                                    self.current_batch = None;
-                                    self.current_row_idx = 0;
-                                    return Ok(true);
-                                }
-                                Err(e) => {
-                                    eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                Ok(file) => match ParquetRecordBatchReaderBuilder::try_new(file) {
+                    Ok(builder) => {
+                        let schema = builder.schema();
+                        if let Err(e) = validate_trade_schema(schema.as_ref()) {
+                            eprintln!(
+                                "Warning: Skipping parquet trade file with invalid schema {:?}: {}",
+                                file_path.file_name().unwrap_or_default(),
+                                e
+                            );
                             continue;
                         }
+
+                        match builder.build() {
+                            Ok(reader) => {
+                                self.current_reader = Some(Box::new(reader));
+                                self.current_batch = None;
+                                self.current_row_idx = 0;
+                                return Ok(true);
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                continue;
+                            }
+                        }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    eprintln!("Warning: Skipping unreadable parquet file {:?}: {}", file_path, e);
+                    eprintln!(
+                        "Warning: Skipping unreadable parquet file {:?}: {}",
+                        file_path, e
+                    );
                     continue;
                 }
             }
         }
     }
 
-    fn read_trade_from_batch(&self, batch: &RecordBatch, row_idx: usize) -> Result<TradeEvent, Box<dyn Error>> {
-        let timestamp_col = batch.column_by_name("timestamp_ms")
+    fn read_trade_from_batch(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> Result<TradeEvent, Box<dyn Error>> {
+        let timestamp_col = batch
+            .column_by_name("timestamp_ms")
             .ok_or("Missing timestamp_ms column")?
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
             .ok_or("Invalid timestamp column type")?;
-        
-        let price_col = batch.column_by_name("price")
+
+        let price_col = batch
+            .column_by_name("price")
             .ok_or("Missing price column")?
             .as_any()
             .downcast_ref::<Float64Array>()
             .ok_or("Invalid price column type")?;
-            
-        let quantity_col = batch.column_by_name("quantity")
+
+        let quantity_col = batch
+            .column_by_name("quantity")
             .ok_or("Missing quantity column")?
             .as_any()
             .downcast_ref::<Float64Array>()
             .ok_or("Invalid quantity column type")?;
-            
-        let maker_col = batch.column_by_name("is_buyer_maker")
+
+        let maker_col = batch
+            .column_by_name("is_buyer_maker")
             .ok_or("Missing is_buyer_maker column")?
             .as_any()
             .downcast_ref::<BooleanArray>()
@@ -508,7 +604,8 @@ impl ParquetTradeIterator {
 
         let timestamp = timestamp_col.value(row_idx) as u64;
         let price = Decimal::from_f64(price_col.value(row_idx)).ok_or("Invalid price value")?;
-        let quantity = Decimal::from_f64(quantity_col.value(row_idx)).ok_or("Invalid quantity value")?;
+        let quantity =
+            Decimal::from_f64(quantity_col.value(row_idx)).ok_or("Invalid quantity value")?;
         let is_buyer_maker = maker_col.value(row_idx);
 
         Ok(TradeEvent {
@@ -581,17 +678,6 @@ impl ParquetOrderbookIterator {
                 .filter(|path| path.extension().and_then(|s| s.to_str()) == Some("parquet"))
                 .collect();
             files.sort(); // Sort by filename for time ordering
-
-            // Check if the last file is valid (it might be the active file being written)
-            if let Some(last_file) = files.last() {
-                if let Ok(file) = File::open(last_file) {
-                    if ParquetRecordBatchReaderBuilder::try_new(file).is_err() {
-                        eprintln!("\nWarning: Skipping incomplete/active parquet file: {:?}", last_file.file_name().unwrap());
-                        files.pop();
-                    }
-                }
-            }
-            
             files
         } else {
             vec![path.to_path_buf()]
@@ -601,21 +687,77 @@ impl ParquetOrderbookIterator {
             return Err("No Parquet files found".into());
         }
 
-        // Read first file to determine max_levels
-        let first_file = File::open(&files[0])?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(first_file)?;
-        let schema = builder.schema();
-
-        // Count bid_price fields to determine max_levels
+        // Find the first valid file to determine max_levels
         let mut max_levels = 0;
-        for field in schema.fields() {
-            if field.name().starts_with("bid_price_") {
-                max_levels += 1;
+        let mut first_valid_file_found = false;
+
+        // Filter out invalid files from the start
+        // This avoids issues where the first file is corrupt and crashes initialization
+        let mut valid_files = Vec::new();
+
+        for file_path in files {
+            match File::open(&file_path) {
+                Ok(file) => match ParquetRecordBatchReaderBuilder::try_new(file) {
+                    Ok(builder) => {
+                        let schema = builder.schema();
+                        let detected_levels = schema
+                            .fields()
+                            .iter()
+                            .filter(|field| field.name().starts_with("bid_price_"))
+                            .count();
+
+                        if detected_levels == 0 {
+                            eprintln!(
+                                "Warning: Skipping parquet orderbook file with no levels {:?}",
+                                file_path.file_name().unwrap()
+                            );
+                            continue;
+                        }
+
+                        if !first_valid_file_found {
+                            max_levels = detected_levels;
+                            first_valid_file_found = true;
+                        } else if detected_levels != max_levels {
+                            eprintln!(
+                                    "Warning: Skipping parquet orderbook file with mismatched level count {:?} (expected {}, found {})",
+                                    file_path.file_name().unwrap(),
+                                    max_levels,
+                                    detected_levels
+                                );
+                            continue;
+                        }
+
+                        if let Err(e) = validate_orderbook_schema(schema.as_ref(), max_levels) {
+                            eprintln!(
+                                    "Warning: Skipping parquet orderbook file with invalid schema {:?}: {}",
+                                    file_path.file_name().unwrap(),
+                                    e
+                                );
+                            continue;
+                        }
+
+                        valid_files.push(file_path);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Skipping corrupt/incomplete parquet file during init {:?}: {}", file_path.file_name().unwrap(), e);
+                    }
+                },
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Skipping unreadable parquet file during init {:?}: {}",
+                        file_path.file_name().unwrap(),
+                        e
+                    );
+                }
             }
         }
 
+        if valid_files.is_empty() {
+            return Err("No valid Parquet files found".into());
+        }
+
         let mut iter = Self {
-            files,
+            files: valid_files,
             current_file_idx: 0,
             current_reader: None,
             current_batch: None,
@@ -625,6 +767,9 @@ impl ParquetOrderbookIterator {
 
         // Initialize first file
         iter.advance_file()?;
+        if iter.current_reader.is_none() {
+            return Err("No valid Parquet orderbook files found".into());
+        }
 
         Ok(iter)
     }
@@ -639,39 +784,56 @@ impl ParquetOrderbookIterator {
             self.current_file_idx += 1;
 
             match File::open(file_path) {
-                Ok(file) => {
-                    match ParquetRecordBatchReaderBuilder::try_new(file) {
-                        Ok(builder) => {
-                            match builder.build() {
-                                Ok(reader) => {
-                                    self.current_reader = Some(Box::new(reader));
-                                    self.current_batch = None;
-                                    self.current_row_idx = 0;
-                                    return Ok(true);
-                                }
-                                Err(e) => {
-                                    eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
-                                    continue;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                Ok(file) => match ParquetRecordBatchReaderBuilder::try_new(file) {
+                    Ok(builder) => {
+                        let schema = builder.schema();
+                        if let Err(e) = validate_orderbook_schema(schema.as_ref(), self.max_levels)
+                        {
+                            eprintln!(
+                                    "Warning: Skipping parquet orderbook file with invalid schema {:?}: {}",
+                                    file_path,
+                                    e
+                                );
                             continue;
                         }
+
+                        match builder.build() {
+                            Ok(reader) => {
+                                self.current_reader = Some(Box::new(reader));
+                                self.current_batch = None;
+                                self.current_row_idx = 0;
+                                return Ok(true);
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                continue;
+                            }
+                        }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                        continue;
+                    }
+                },
                 Err(e) => {
-                    eprintln!("Warning: Skipping unreadable parquet file {:?}: {}", file_path, e);
+                    eprintln!(
+                        "Warning: Skipping unreadable parquet file {:?}: {}",
+                        file_path, e
+                    );
                     continue;
                 }
             }
         }
     }
 
-    fn read_snapshot_from_batch(&self, batch: &RecordBatch, row_idx: usize) -> Result<OrderbookSnapshot, Box<dyn Error>> {
+    fn read_snapshot_from_batch(
+        &self,
+        batch: &RecordBatch,
+        row_idx: usize,
+    ) -> Result<OrderbookSnapshot, Box<dyn Error>> {
         // Extract timestamp
-        let timestamp_col = batch.column(0)
+        let timestamp_col = batch
+            .column(0)
             .as_any()
             .downcast_ref::<TimestampMillisecondArray>()
             .ok_or("Invalid timestamp column")?;
@@ -691,19 +853,23 @@ impl ParquetOrderbookIterator {
                 break;
             }
 
-            let bid_price_col = batch.column(bid_price_idx)
+            let bid_price_col = batch
+                .column(bid_price_idx)
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or("Invalid bid_price column")?;
-            let bid_qty_col = batch.column(bid_qty_idx)
+            let bid_qty_col = batch
+                .column(bid_qty_idx)
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or("Invalid bid_qty column")?;
-            let ask_price_col = batch.column(ask_price_idx)
+            let ask_price_col = batch
+                .column(ask_price_idx)
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or("Invalid ask_price column")?;
-            let ask_qty_col = batch.column(ask_qty_idx)
+            let ask_qty_col = batch
+                .column(ask_qty_idx)
                 .as_any()
                 .downcast_ref::<Float64Array>()
                 .ok_or("Invalid ask_qty column")?;
