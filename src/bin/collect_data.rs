@@ -18,7 +18,7 @@
 /// The service can be interrupted and restarted - it will resume from where
 /// it left off and avoid duplicates.
 use extended_data_collector::{
-    init_logging, rest::RestClient, OrderbookParquetWriter, TradesCsvWriter, WebSocketClient,
+    init_logging, rest::RestClient, OrderbookParquetWriter, TradesParquetWriter, WebSocketClient,
 };
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
@@ -64,7 +64,7 @@ impl Config {
 struct MarketCollector {
     market: String,
     data_dir: PathBuf,
-    trades_writer: Option<Arc<TradesCsvWriter>>,
+    trades_writer: Option<Arc<TradesParquetWriter>>,
     orderbook_writer: Option<Arc<OrderbookParquetWriter>>,
 }
 
@@ -76,7 +76,7 @@ impl MarketCollector {
         collect_orderbook: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let trades_writer = if collect_trades {
-            Some(Arc::new(TradesCsvWriter::new(data_dir, &market)?))
+            Some(Arc::new(TradesParquetWriter::new(data_dir, &market)?))
         } else {
             None
         };
@@ -99,10 +99,24 @@ impl MarketCollector {
     async fn collect_trades(&self, ws_client: &WebSocketClient) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &self.trades_writer {
             println!("📊 Starting trades collection for {}", self.market);
-            let writer: Arc<TradesCsvWriter> = Arc::clone(writer);
+            let writer: Arc<TradesParquetWriter> = Arc::clone(writer);
             let market = self.market.clone();
             let data_dir = self.data_dir.clone();
             let ws_client = ws_client.clone();
+
+            // Spawn periodic flush task (every 30 seconds)
+            let flush_writer: Arc<TradesParquetWriter> = Arc::clone(&writer);
+            let flush_market = market.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                interval.tick().await; // First tick completes immediately
+                loop {
+                    interval.tick().await;
+                    if let Err(e) = flush_writer.force_flush().await {
+                        eprintln!("⚠️ Periodic flush error for {}: {}", flush_market, e);
+                    }
+                }
+            });
 
             tokio::spawn(async move {
                 // Initialize REST client for backfilling

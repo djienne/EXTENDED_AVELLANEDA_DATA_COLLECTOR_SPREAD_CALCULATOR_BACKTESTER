@@ -12,7 +12,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Build release binary
-RUN cargo build --release --bin collect_data
+RUN cargo build --release
 
 # Stage 2: Runtime image
 FROM debian:bookworm-slim
@@ -32,8 +32,12 @@ RUN groupadd -r -g 1000 collector && \
 # Create app directory
 WORKDIR /app
 
-# Copy the binary from builder
+# Copy the binaries from builder
 COPY --from=builder /build/target/release/collect_data /app/collect_data
+COPY --from=builder /build/target/release/backtest /app/backtest
+COPY --from=builder /build/target/release/grid_search /app/grid_search
+COPY --from=builder /build/target/release/migrate_orderbook_to_parquet /app/migrate_orderbook_to_parquet
+COPY --from=builder /build/target/release/migrate_trades_to_parquet /app/migrate_trades_to_parquet
 
 # Create data directory and set ownership
 RUN mkdir -p /app/data && \
