@@ -12,7 +12,7 @@ use std::env;
 
 /// Default paths
 const DEFAULT_CONFIG_PATH: &str = "config.json";
-const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades.csv";
+const DEFAULT_TRADES_PATH: &str = "data/eth_usd/trades_parts";
 const DEFAULT_ORDERBOOK_PATH: &str = "data/eth_usd/orderbook_parts";
 const DEFAULT_OUTPUT_PATH: &str = "data/eth_usd/as_results.csv";
 
