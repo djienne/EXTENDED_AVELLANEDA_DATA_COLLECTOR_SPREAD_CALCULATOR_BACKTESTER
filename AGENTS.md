@@ -6,6 +6,7 @@
 - CLI binaries are in `src/bin/` (e.g. `collect_data.rs`, `backtest.rs`, `calculate_spread.rs`, `verify_orderbook.rs`); examples are under `examples/`.
 - Collected market data is written to `data/{market}/` (e.g. `data/btc_usd/trades.csv`, `orderbook_depth.csv`, `state.json`); documentation lives in `DOC/full_doc.txt`.
 - Configuration is via `config.json` and environment variables loaded from `.env` (never commit real secrets; use `.env.example` as a template).
+- Intensity calibration now requires orderbook exposure points (see `calibration_engine.rs:add_orderbook`). Always feed snapshots with timestamps and mids; `fit_intensity_parameters` consumes trades + `OrderbookPoint` slice + window end ts.
 
 ## Build, Test, and Development Commands
 
@@ -25,6 +26,7 @@
 - Prefer `#[test]` unit tests colocated with the module (see `src/lib.rs` for an example); use `#[tokio::test]` for async behavior.
 - Before submitting changes, run `cargo test` and any relevant `cargo run --bin ...` commands that exercise your changes (e.g. short `collect_data` runs against test markets).
 - When touching CSV or resume logic, add tests that cover edge cases such as duplicate trades, sequence gaps, and restart behavior.
+- When touching intensity fitting, keep exposure-aware MLE intact (uses per-snapshot delta_min/delta_max durations). Avoid reverting to trade-only mean-delta estimates.
 
 ## Commit & Pull Request Guidelines
 
