@@ -174,7 +174,13 @@ The system fits separate exponential decay models for each side:
 $$\lambda_{bid}(\delta) = A_{bid} \cdot e^{-\kappa_{bid} \cdot \delta}$$
 $$\lambda_{ask}(\delta) = A_{ask} \cdot e^{-\kappa_{ask} \cdot \delta}$$
 
-Where $\lambda$ is the arrival rate of market orders at distance $\delta$ from the mid price. These parameters are estimated from historical trade data using linear regression on log-transformed rates.
+Where $\lambda$ is the arrival rate of market orders at distance $\delta$ from the mid price. These parameters are estimated with a truncated exponential MLE that uses both trades and orderbook exposure:
+
+- **Exposure-aware**: For each orderbook snapshot, the model integrates over the reachable range `[δ_min, δ_max]` (best to furthest level) and the time until the next snapshot.
+- **Trade mapping**: Each trade delta is measured from the mid of the most recent snapshot at that timestamp.
+- **Separate sides**: Bid and ask κ/A are fitted independently; if one side lacks data, the other side’s fit is reused; if neither fits, defaults are applied.
+
+This avoids bias toward ambient spreads (uses exposure instead of a simple mean-delta) and respects left-truncation from the prevailing spread/tick.
 
 ## Architecture
 
