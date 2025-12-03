@@ -22,6 +22,7 @@ pub struct ASConfig {
     pub inventory_horizon_seconds: u64,
     pub gamma_min: f64,
     pub gamma_max: f64,
+    pub gamma_grid_points: usize,
     pub max_inventory: f64,
     pub tick_size: f64,
     pub max_shift_ticks: f64,
@@ -70,6 +71,7 @@ impl Default for ASConfig {
             inventory_horizon_seconds: 60, // 1 minute (matches tight crypto market spreads)
             gamma_min: 0.1,
             gamma_max: 5.0,
+            gamma_grid_points: 5,
             max_inventory: 10.0,
             tick_size: 0.01,
             max_shift_ticks: 100.0,

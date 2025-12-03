@@ -1,8 +1,15 @@
-/// Data collection module for saving WebSocket streams to CSV files
+/// LEGACY: Data collection module for saving WebSocket streams to CSV files
 ///
-/// This module provides utilities for continuously collecting orderbook
-/// and trade data from WebSocket streams and saving them to CSV files
-/// with deduplication and resume capability.
+/// ⚠️ DEPRECATED: This module contains legacy CSV writers that are no longer used
+/// in the main data collection pipeline. The system now uses Parquet format
+/// (see `storage/parquet_writer.rs`) for superior compression and performance.
+///
+/// This module is kept for:
+/// - Backward compatibility with existing code
+/// - Migration utilities
+/// - Testing purposes
+///
+/// For new code, use `OrderbookParquetWriter` and `TradesParquetWriter` instead.
 
 use crate::error::Result;
 use crate::types::{PublicTrade, WsOrderBookMessage};
@@ -29,6 +36,10 @@ pub struct CollectorState {
     pub last_orderbook_timestamp: Option<u64>,
     pub trades_count: u64,
     pub orderbook_updates_count: u64,
+    #[serde(default)]
+    pub orderbook_part_counter: usize,
+    #[serde(default)]
+    pub trades_part_counter: usize,
     #[serde(skip)]
     #[serde(default = "default_instant")]
     pub last_orderbook_flush: std::time::Instant,
@@ -52,6 +63,8 @@ impl CollectorState {
             last_orderbook_timestamp: None,
             trades_count: 0,
             orderbook_updates_count: 0,
+            orderbook_part_counter: 0,
+            trades_part_counter: 0,
             last_orderbook_flush: now,
             last_trades_flush: now,
         }
@@ -199,7 +212,10 @@ impl OrderbookState {
     }
 }
 
-/// CSV writer for public trades with deduplication
+/// LEGACY: CSV writer for public trades with deduplication
+///
+/// ⚠️ DEPRECATED: Use `TradesParquetWriter` from `storage/parquet_writer.rs` instead.
+/// This writer is kept only for backward compatibility and migration purposes.
 pub struct TradesCsvWriter {
     file_path: PathBuf,
     state: Arc<Mutex<CollectorState>>,
@@ -364,7 +380,10 @@ impl TradesCsvWriter {
     }
 }
 
-/// CSV writer for orderbook updates with deduplication
+/// LEGACY: CSV writer for orderbook updates with deduplication
+///
+/// ⚠️ DEPRECATED: Use `OrderbookParquetWriter` from `storage/parquet_writer.rs` instead.
+/// This writer is kept only for backward compatibility and migration purposes.
 pub struct OrderbookCsvWriter {
     file_path: PathBuf,
     state: Arc<Mutex<CollectorState>>,
@@ -647,7 +666,10 @@ impl OrderbookCsvWriter {
     }
 }
 
-/// CSV writer for full orderbook depth with multiple levels
+/// LEGACY: CSV writer for full orderbook depth with multiple levels
+///
+/// ⚠️ DEPRECATED: Use `OrderbookParquetWriter` from `storage/parquet_writer.rs` instead.
+/// This writer is kept only for backward compatibility and migration purposes.
 pub struct FullOrderbookCsvWriter {
     file_path: PathBuf,
     state: Arc<Mutex<CollectorState>>,

@@ -46,6 +46,7 @@ struct RawTrade {
 pub struct DataLoader {
     trades_path: PathBuf,
     orderbook_path: PathBuf,
+    suppress_warnings: bool,
 }
 
 impl DataLoader {
@@ -53,6 +54,7 @@ impl DataLoader {
         Self {
             trades_path: trades_path.to_path_buf(),
             orderbook_path: orderbook_path.to_path_buf(),
+            suppress_warnings: true,
         }
     }
 
@@ -64,7 +66,7 @@ impl DataLoader {
 
         if use_parquet {
             let mut trades = Vec::new();
-            let iter = ParquetTradeIterator::new(&self.trades_path)?;
+            let iter = ParquetTradeIterator::new(&self.trades_path, self.suppress_warnings)?;
             for result in iter {
                 trades.push(result?);
             }
@@ -90,7 +92,7 @@ impl DataLoader {
             || self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         if use_parquet {
-            let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path)?;
+            let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path, self.suppress_warnings)?;
             Ok(OrderbookIterator::Parquet(parquet_iter))
         } else {
             let file = File::open(&self.orderbook_path)?;
@@ -118,7 +120,7 @@ impl DataLoader {
             || self.trades_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         let trade_source = if use_parquet_trades {
-            let iter = ParquetTradeIterator::new(&self.trades_path)?;
+            let iter = ParquetTradeIterator::new(&self.trades_path, self.suppress_warnings)?;
             TradeSource::Parquet(iter)
         } else {
             let trades_file = File::open(&self.trades_path)?;
@@ -133,7 +135,7 @@ impl DataLoader {
             || self.orderbook_path.extension().and_then(|s| s.to_str()) == Some("parquet");
 
         let (orderbook_source, max_levels) = if use_parquet_ob {
-            let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path)?;
+            let parquet_iter = ParquetOrderbookIterator::new(&self.orderbook_path, self.suppress_warnings)?;
             let max = parquet_iter.max_levels;
             (OrderbookSource::Parquet(parquet_iter), max)
         } else {
@@ -164,11 +166,7 @@ impl DataLoader {
 
     /// Load all data events into memory for fast iteration, sorted by timestamp and deduplicated
     pub fn load_all_events(&self) -> Result<Vec<DataEvent>, Box<dyn Error>> {
-        let stream = self.stream()?;
-        let mut events = Vec::with_capacity(100_000); // Reasonable initial guess
-        for event in stream {
-            events.push(event?);
-        }
+        let mut events = self.load_events_raw()?;
 
         // 1. Sort by timestamp (stable sort to preserve relative order of same-timestamp events if needed)
         events.sort_by_key(|e| e.timestamp());
@@ -216,6 +214,16 @@ impl DataLoader {
         }
 
         Ok(unique_events)
+    }
+
+    /// Load events in their original arrival order without sorting or deduplication
+    pub fn load_events_raw(&self) -> Result<Vec<DataEvent>, Box<dyn Error>> {
+        let stream = self.stream()?;
+        let mut events = Vec::with_capacity(100_000); // Reasonable initial guess
+        for event in stream {
+            events.push(event?);
+        }
+        Ok(events)
     }
 }
 
@@ -483,10 +491,12 @@ pub struct ParquetTradeIterator {
     current_reader: Option<Box<dyn Iterator<Item = Result<RecordBatch, arrow::error::ArrowError>>>>,
     current_batch: Option<RecordBatch>,
     current_row_idx: usize,
+    warned_files: HashSet<PathBuf>,
+    suppress_warnings: bool,
 }
 
 impl ParquetTradeIterator {
-    pub fn new(path: &Path) -> Result<Self, Box<dyn Error>> {
+    pub fn new(path: &Path, suppress_warnings: bool) -> Result<Self, Box<dyn Error>> {
         let files = if path.is_dir() {
             let mut files: Vec<PathBuf> = fs::read_dir(path)?
                 .filter_map(|entry| entry.ok())
@@ -509,6 +519,8 @@ impl ParquetTradeIterator {
             current_reader: None,
             current_batch: None,
             current_row_idx: 0,
+            warned_files: HashSet::new(),
+            suppress_warnings,
         };
 
         iter.advance_file()?;
@@ -548,21 +560,27 @@ impl ParquetTradeIterator {
                                 return Ok(true);
                             }
                             Err(e) => {
-                                eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                                    eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                }
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                        if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                            eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                        }
                         continue;
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Skipping unreadable parquet file {:?}: {}",
-                        file_path, e
-                    );
+                    if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                        eprintln!(
+                            "Warning: Skipping unreadable parquet file {:?}: {}",
+                            file_path, e
+                        );
+                    }
                     continue;
                 }
             }
@@ -666,10 +684,12 @@ pub struct ParquetOrderbookIterator {
     current_batch: Option<RecordBatch>,
     current_row_idx: usize,
     pub max_levels: usize, // Made public to access from stream()
+    warned_files: HashSet<PathBuf>,
+    suppress_warnings: bool,
 }
 
 impl ParquetOrderbookIterator {
-    pub fn new(path: &Path) -> Result<Self, Box<dyn Error>> {
+    pub fn new(path: &Path, suppress_warnings: bool) -> Result<Self, Box<dyn Error>> {
         // If path is a directory, collect all .parquet files
         let files = if path.is_dir() {
             let mut files: Vec<PathBuf> = fs::read_dir(path)?
@@ -694,6 +714,7 @@ impl ParquetOrderbookIterator {
         // Filter out invalid files from the start
         // This avoids issues where the first file is corrupt and crashes initialization
         let mut valid_files = Vec::new();
+        let mut warned_files = HashSet::new();
 
         for file_path in files {
             match File::open(&file_path) {
@@ -728,26 +749,32 @@ impl ParquetOrderbookIterator {
                         }
 
                         if let Err(e) = validate_orderbook_schema(schema.as_ref(), max_levels) {
-                            eprintln!(
+                            if !suppress_warnings && warned_files.insert(file_path.clone()) {
+                                eprintln!(
                                     "Warning: Skipping parquet orderbook file with invalid schema {:?}: {}",
                                     file_path.file_name().unwrap(),
                                     e
                                 );
+                            }
                             continue;
                         }
 
                         valid_files.push(file_path);
                     }
                     Err(e) => {
-                        eprintln!("Warning: Skipping corrupt/incomplete parquet file during init {:?}: {}", file_path.file_name().unwrap(), e);
+                        if !suppress_warnings && warned_files.insert(file_path.clone()) {
+                            eprintln!("Warning: Skipping corrupt/incomplete parquet file during init {:?}: {}", file_path.file_name().unwrap(), e);
+                        }
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Skipping unreadable parquet file during init {:?}: {}",
-                        file_path.file_name().unwrap(),
-                        e
-                    );
+                    if !suppress_warnings && warned_files.insert(file_path.clone()) {
+                        eprintln!(
+                            "Warning: Skipping unreadable parquet file during init {:?}: {}",
+                            file_path.file_name().unwrap(),
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -763,6 +790,8 @@ impl ParquetOrderbookIterator {
             current_batch: None,
             current_row_idx: 0,
             max_levels,
+            warned_files,
+            suppress_warnings,
         };
 
         // Initialize first file
@@ -789,11 +818,13 @@ impl ParquetOrderbookIterator {
                         let schema = builder.schema();
                         if let Err(e) = validate_orderbook_schema(schema.as_ref(), self.max_levels)
                         {
-                            eprintln!(
+                            if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                                eprintln!(
                                     "Warning: Skipping parquet orderbook file with invalid schema {:?}: {}",
                                     file_path,
                                     e
                                 );
+                            }
                             continue;
                         }
 
@@ -805,21 +836,27 @@ impl ParquetOrderbookIterator {
                                 return Ok(true);
                             }
                             Err(e) => {
-                                eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                                    eprintln!("Warning: Skipping corrupt parquet file (build failed) {:?}: {}", file_path, e);
+                                }
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                        if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                            eprintln!("Warning: Skipping corrupt parquet file (invalid footer/metadata) {:?}: {}", file_path, e);
+                        }
                         continue;
                     }
                 },
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Skipping unreadable parquet file {:?}: {}",
-                        file_path, e
-                    );
+                    if !self.suppress_warnings && self.warned_files.insert(file_path.clone()) {
+                        eprintln!(
+                            "Warning: Skipping unreadable parquet file {:?}: {}",
+                            file_path, e
+                        );
+                    }
                     continue;
                 }
             }

@@ -37,7 +37,7 @@ const DEFAULT_MIN_FILLS: u64 = 5;
 /// Default horizons: 5m, 15m, 30m, 1h, 2h, 4h
 const DEFAULT_HORIZONS: &[u64] = &[300, 900, 1800, 3600, 7200, 14400];
 
-/// Default gamma values
+/// Default gamma values used when neither config nor CLI provide overrides
 const DEFAULT_GAMMAS: &[f64] = &[0.01, 0.05, 0.1, 0.2];
 
 // =============================================================================
@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut order_notional = DEFAULT_ORDER_NOTIONAL;
     let mut min_fills = DEFAULT_MIN_FILLS;
     let mut horizons: Vec<u64> = DEFAULT_HORIZONS.to_vec();
-    let mut gammas: Vec<f64> = DEFAULT_GAMMAS.to_vec();
+    let mut gammas: Vec<f64> = Vec::new();
     let mut num_threads: Option<usize> = None;
 
     let mut i = 1;
@@ -216,8 +216,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // If gammas not provided via CLI, prefer config gamma bounds; otherwise fallback defaults
+    if gammas.is_empty() {
+        if base_config.gamma_max > base_config.gamma_min && base_config.gamma_max > 0.0 {
+            let min_g = base_config.gamma_min.max(0.0);
+            let max_g = base_config.gamma_max;
+            let points = base_config.gamma_grid_points.max(2);
+            if points == 2 || min_g <= 0.0 {
+                gammas = vec![min_g.max(1e-6), max_g];
+            } else {
+                let log_min = min_g.ln();
+                let log_max = max_g.ln();
+                let step = (log_max - log_min) / (points as f64 - 1.0);
+                gammas = (0..points)
+                    .map(|i| (log_min + step * i as f64).exp())
+                    .collect();
+            }
+        } else {
+            gammas = DEFAULT_GAMMAS.to_vec();
+        }
+    }
+
     // Determine thread count
     let num_threads = num_threads.unwrap_or(base_config.num_threads);
+
+    // Apply defaults if horizons/gammas empty
+    if horizons.is_empty() {
+        horizons = DEFAULT_HORIZONS.to_vec();
+    }
 
     // Generate all combinations
     let mut configs = Vec::with_capacity(horizons.len() * gammas.len());
@@ -274,6 +300,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut config = base_config.clone();
         config.inventory_horizon_seconds = grid_config.horizon;
         config.risk_aversion_gamma = grid_config.gamma;
+        // Ensure gamma is applied directly without scaling/clamping in the quote model
+        config.gamma_mode = extended_data_collector::model_types::GammaMode::Constant;
+        config.gamma_min = grid_config.gamma;
+        config.gamma_max = grid_config.gamma;
 
         // Each thread needs its own data loader
         let loader = DataLoader::new(

@@ -1,4 +1,4 @@
-use extended_data_collector::model_types::ASConfig;
+use extended_data_collector::model_types::{ASConfig, GammaMode};
 use extended_data_collector::data_loader::DataLoader;
 use extended_data_collector::metrics::calculate_effective_price;
 use extended_data_collector::calibration_engine::CalibrationEngine;
@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 1. Load Config
-    let config = match std::fs::read_to_string(&config_path) {
+    let mut config = match std::fs::read_to_string(&config_path) {
         Ok(contents) => {
             match serde_json::from_str::<ASConfig>(&contents) {
                 Ok(cfg) => {
@@ -87,6 +87,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ASConfig::default()
         }
     };
+    // Force usage of provided risk_aversion_gamma value (no inventory scaling)
+    config.gamma_mode = GammaMode::Constant;
+    config.gamma_min = config.risk_aversion_gamma;
+    config.gamma_max = config.risk_aversion_gamma;
     println!("Using Config: {:?}", config);
 
     // 2. Load Data

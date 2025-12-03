@@ -338,6 +338,7 @@ impl MarketCollector {
     async fn shutdown(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(writer) = &self.trades_writer {
             writer.save_state().await?;
+            writer.close_writer().await?;
         }
         if let Some(writer) = &self.orderbook_writer {
             writer.save_state().await?;

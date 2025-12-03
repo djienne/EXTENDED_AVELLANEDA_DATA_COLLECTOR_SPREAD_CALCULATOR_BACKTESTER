@@ -45,17 +45,15 @@ pub fn compute_optimal_quote(
     timestamp: u64,
     mid_price: Decimal,
     inventory: Decimal,
-    sigma_pct_raw: f64,
-    bid_kappa: f64,
-    ask_kappa: f64,
+    sigma_pct_raw: f64, // per-second log-return volatility (dimensionless)
+    bid_kappa: f64,     // 1/price
+    ask_kappa: f64,     // 1/price
     config: &ASConfig,
 ) -> OptimalQuote {
-    let sigma_pct = clamp_sigma(sigma_pct_raw, config);
+    let sigma_pct = clamp_sigma(sigma_pct_raw, config).max(0.0);
     let mid_f64 = mid_price.to_f64().unwrap_or(0.0);
-    let sigma_abs = mid_f64 * sigma_pct;
-
     let t_horizon = config.inventory_horizon_seconds as f64;
-    let sigma_sq = sigma_abs.powi(2);
+    let sigma_sq = sigma_pct.powi(2);
 
     let inv_abs = inventory.abs().to_f64().unwrap_or(0.0);
     let inv_ratio = if config.max_inventory > 0.0 {
@@ -63,16 +61,25 @@ pub fn compute_optimal_quote(
     } else {
         0.0
     };
+    let inv_ratio_signed = if config.max_inventory > 0.0 {
+        (inventory.to_f64().unwrap_or(0.0) / config.max_inventory).clamp(-1.0, 1.0)
+    } else {
+        0.0
+    };
     
+    // Gamma is treated as dimensionless; scale pricing terms via percentage domain.
     let gamma_constant = config.risk_aversion_gamma.max(MIN_GAMMA);
     
-    // Calculate gamma_from_shift with additional safeguards
+    // Calculate gamma_from_shift in return space so gamma stays dimensionless
     let gamma_from_shift = {
-        let denominator = sigma_sq * t_horizon * config.max_inventory;
-        if sigma_sq > 1e-12 && t_horizon > 0.0 && config.max_inventory > 0.0 && denominator > 1e-12 {
-            let raw_gamma = (config.max_shift_ticks * config.tick_size) / denominator;
-            // Clamp to prevent extremely large values
-            raw_gamma.min(MAX_GAMMA_LIMIT)
+        if sigma_sq > 1e-12 && t_horizon > 0.0 && mid_f64 > 0.0 {
+            let target_shift_return = (config.max_shift_ticks * config.tick_size) / mid_f64;
+            let denom = sigma_sq * t_horizon;
+            if denom > 0.0 {
+                (target_shift_return / denom).min(MAX_GAMMA_LIMIT)
+            } else {
+                gamma_constant
+            }
         } else {
             gamma_constant
         }
@@ -91,18 +98,26 @@ pub fn compute_optimal_quote(
         gamma = gamma.clamp(min_g, max_g);
     }
 
-    // Calculate separate bid and ask spreads using side-specific kappa values
-    let vol_risk_term = gamma * sigma_sq * t_horizon;
+    // Convert kappa to return space so gamma/kappa is dimensionless
+    let bid_kappa_pct = if mid_f64 > 0.0 { bid_kappa * mid_f64 } else { bid_kappa };
+    let ask_kappa_pct = if mid_f64 > 0.0 { ask_kappa * mid_f64 } else { ask_kappa };
+
+    // Calculate separate bid and ask spreads using side-specific kappa values (all in return space)
+    let vol_risk_term_ret = gamma * sigma_sq * t_horizon;
 
     // Bid spread calculation
-    let bid_kappa_eff = if bid_kappa > 0.0 { bid_kappa } else { 10.0 };
+    let bid_kappa_eff = if bid_kappa_pct > 0.0 { bid_kappa_pct } else { 10.0 };
     let bid_term = (1.0 + (gamma / bid_kappa_eff)).max(MIN_GAMMA);
-    let bid_spread_f64 = vol_risk_term + (2.0 / gamma) * bid_term.ln();
+    let bid_spread_ret = vol_risk_term_ret + (2.0 / gamma) * bid_term.ln();
 
     // Ask spread calculation
-    let ask_kappa_eff = if ask_kappa > 0.0 { ask_kappa } else { 10.0 };
+    let ask_kappa_eff = if ask_kappa_pct > 0.0 { ask_kappa_pct } else { 10.0 };
     let ask_term = (1.0 + (gamma / ask_kappa_eff)).max(MIN_GAMMA);
-    let ask_spread_f64 = vol_risk_term + (2.0 / gamma) * ask_term.ln();
+    let ask_spread_ret = vol_risk_term_ret + (2.0 / gamma) * ask_term.ln();
+
+    // Convert spreads back to price space
+    let bid_spread_f64 = if mid_f64 > 0.0 { bid_spread_ret * mid_f64 } else { bid_spread_ret };
+    let ask_spread_f64 = if mid_f64 > 0.0 { ask_spread_ret * mid_f64 } else { ask_spread_ret };
 
     // Convert to Decimal and validate
     let mut bid_spread = if bid_spread_f64.is_finite() && bid_spread_f64 > 0.0 {
@@ -158,11 +173,12 @@ pub fn compute_optimal_quote(
     }
 
     // Calculate reservation price adjustment
-    let risk_adjustment_f64 = inventory.to_f64().unwrap_or(0.0) * gamma * sigma_sq * t_horizon;
-    let risk_adjustment = if risk_adjustment_f64.is_finite() {
-        Decimal::from_f64(risk_adjustment_f64).unwrap_or(Decimal::ZERO)
+    // Reservation price adjustment in return space
+    let risk_adjustment_ret = inv_ratio_signed * gamma * sigma_sq * t_horizon;
+    let risk_adjustment = if mid_f64 > 0.0 {
+        Decimal::from_f64(risk_adjustment_ret * mid_f64).unwrap_or(Decimal::ZERO)
     } else {
-        Decimal::ZERO
+        Decimal::from_f64(risk_adjustment_ret).unwrap_or(Decimal::ZERO)
     };
     
     let mut reservation_price = mid_price - risk_adjustment;
