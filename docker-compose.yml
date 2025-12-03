@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: extended_data_collector
 
+    # Override command to run with timeout for periodic restarts (forces parquet flush)
+    # Runs for 60 seconds, then exits gracefully, triggering automatic restart
+    command: ["/bin/sh", "-c", "timeout -s TERM 300 /app/collect_data || exit 0"]
+
     # User mapping - runs as UID 1000 by default (defined in Dockerfile)
     # Uncomment to override with your host user (Linux/Mac only)
     # user: "${UID:-1000}:${GID:-1000}"

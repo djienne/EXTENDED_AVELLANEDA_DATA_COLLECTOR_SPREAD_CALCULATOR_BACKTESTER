@@ -4,7 +4,7 @@
 /// of prices and trades, and performs periodic recalibration of volatility (σ) and
 /// intensity parameters (κ, A).
 
-use crate::calibration::{calculate_volatility, fit_intensity_parameters, OrderbookPoint};
+use crate::calibration::{calculate_volatility, fit_intensity_parameters, forecast_garch_volatility, OrderbookPoint};
 use crate::data_loader::OrderbookSnapshot;
 use crate::model_types::{ASConfig, TradeEvent};
 use rust_decimal::Decimal;
@@ -36,6 +36,8 @@ pub struct CalibrationResult {
 pub struct CalibrationEngine {
     /// Rolling window of prices for volatility calculation (timestamp, price)
     calibration_prices: Vec<(u64, Decimal)>,
+    /// Growing history of prices for GARCH forecasting (no pruning to avoid forward-looking bias)
+    full_price_history: Vec<(u64, Decimal)>,
     /// Rolling window of orderbook exposure points for intensity fitting
     orderbook_points: Vec<OrderbookPoint>,
     /// Rolling window of trades for intensity parameter fitting
@@ -69,6 +71,7 @@ impl CalibrationEngine {
 
         Self {
             calibration_prices: Vec::with_capacity(estimated_prices),
+            full_price_history: Vec::with_capacity(estimated_prices),
             orderbook_points: Vec::with_capacity(estimated_prices),
             window_trades: Vec::with_capacity(estimated_trades),
             bid_kappa: 10.0,  // Default starting value
@@ -85,6 +88,7 @@ impl CalibrationEngine {
     #[inline]
     pub fn add_price(&mut self, timestamp: u64, price: Decimal) {
         self.calibration_prices.push((timestamp, price));
+        self.full_price_history.push((timestamp, price));
     }
 
     /// Add a full orderbook snapshot to the calibration window (captures exposure and mid)
@@ -92,6 +96,7 @@ impl CalibrationEngine {
     pub fn add_orderbook(&mut self, snapshot: &OrderbookSnapshot, mid_price: Decimal) {
         let timestamp = snapshot.timestamp;
         self.calibration_prices.push((timestamp, mid_price));
+        self.full_price_history.push((timestamp, mid_price));
 
         let best_bid = snapshot.bids.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
         let best_ask = snapshot.asks.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
@@ -162,13 +167,6 @@ impl CalibrationEngine {
         }
     }
 
-    /// Extract prices from calibration_prices for volatility calculation
-    /// Avoids storing duplicate data
-    #[inline]
-    fn get_prices(&self) -> Vec<Decimal> {
-        self.calibration_prices.iter().map(|(_, p)| *p).collect()
-    }
-
     /// Perform calibration and return results
     ///
     /// Returns None if insufficient data for calibration
@@ -181,15 +179,9 @@ impl CalibrationEngine {
             return None;
         }
 
-        // Calculate actual window duration
-        let start_ts = self.calibration_prices.first().map(|(ts, _)| *ts).unwrap_or(current_ts);
-        let actual_duration_sec = ((current_ts.saturating_sub(start_ts)) as f64 / 1000.0).max(1.0);
-
-        // Extract prices for volatility calculation
-        let prices = self.get_prices();
-
-        // Calculate volatility
-        let volatility = calculate_volatility(&prices, actual_duration_sec);
+        // Calculate volatility (GARCH forecast if available, otherwise realized)
+        let volatility = forecast_garch_volatility(&self.full_price_history)
+            .unwrap_or_else(|| calculate_volatility(&self.calibration_prices));
 
         // Fit intensity parameters (returns separate bid/ask values)
         let (new_bid_kappa, new_bid_a, new_ask_kappa, new_ask_a) = fit_intensity_parameters(
@@ -266,6 +258,7 @@ impl CalibrationEngine {
     /// Reset the engine state (useful for reusing across multiple backtests)
     pub fn reset(&mut self) {
         self.calibration_prices.clear();
+        self.full_price_history.clear();
         self.orderbook_points.clear();
         self.window_trades.clear();
         self.bid_kappa = 10.0;

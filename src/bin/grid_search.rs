@@ -187,9 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Path::new(&orderbook_path),
     );
 
-    println!("Loading all data into memory for performance...");
+    println!("Loading all data into memory (raw order, no sorting/dedup) for performance...");
     let start_load = Instant::now();
-    let events = loader.load_all_events()?;
+    let events = loader.load_events_raw()?;
     let duration = start_load.elapsed();
     println!("Loaded {} events in {:.2}s", events.len(), duration.as_secs_f64());
 

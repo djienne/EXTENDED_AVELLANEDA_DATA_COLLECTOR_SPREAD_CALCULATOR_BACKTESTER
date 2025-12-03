@@ -85,6 +85,8 @@ Tests combinations of time horizons and risk aversion (γ) values:
 - Analyzes parameter interactions
 
 ### 6. Migrate Legacy CSV Data
+**Note**: The system now uses Parquet format exclusively for all data collection. This migration tool is only needed if you have historical CSV data from older versions.
+
 Convert old CSV files to Parquet format:
 ```bash
 # Migrate all markets
@@ -125,8 +127,14 @@ cargo run --release --bin migrate_orderbook_to_parquet -- data/eth_usd
 ### Parquet Format
 Data is stored in efficient Parquet format with ZSTD(3) compression:
 - **Orderbook**: `data/{market}/orderbook_parts/part_*.parquet` (25K rows per file)
-- **Trades**: `data/{market}/trades.csv` (CSV format)
+- **Trades**: `data/{market}/trades_parts/part_*.parquet` (50K rows per file)
 - **State**: `data/{market}/state.json` (resume tracking)
+
+**Why Parquet?** The system migrated from CSV to Parquet for:
+- **Superior Compression**: 11.8x compression ratio (vs ~2-3x for gzip CSV)
+- **Faster I/O**: 26% faster writes than SNAPPY, columnar format enables efficient filtering
+- **Type Safety**: Schema enforcement prevents data corruption
+- **Scalability**: Partitioned files support streaming and incremental processing
 
 ### Performance
 - 11.8x compression ratio from raw data
