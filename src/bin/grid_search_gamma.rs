@@ -222,15 +222,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let min_g = base_config.gamma_min.max(0.0);
             let max_g = base_config.gamma_max;
             let points = base_config.gamma_grid_points.max(2);
-            if points == 2 || min_g <= 0.0 {
+            if points == 2 {
                 gammas = vec![min_g.max(1e-6), max_g];
-            } else {
+            } else if base_config.gamma_log_spacing && min_g > 0.0 {
                 let log_min = min_g.ln();
                 let log_max = max_g.ln();
                 let step = (log_max - log_min) / (points as f64 - 1.0);
                 gammas = (0..points)
                     .map(|i| (log_min + step * i as f64).exp())
                     .collect();
+            } else {
+                let step = (max_g - min_g) / (points as f64 - 1.0);
+                gammas = (0..points).map(|i| min_g + step * i as f64).collect();
             }
         } else {
             gammas = DEFAULT_GAMMAS.to_vec();
