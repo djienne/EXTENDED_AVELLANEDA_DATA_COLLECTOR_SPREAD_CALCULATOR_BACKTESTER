@@ -14,6 +14,7 @@
   "gamma_min": 0.01,
   "gamma_max": 100.0,
   "gamma_grid_points": 12,
+  "gamma_log_spacing": false,
   "min_spread_bps": 0.0,
   "max_spread_bps": 200.0,
   "fill_cooldown_seconds": 60,
