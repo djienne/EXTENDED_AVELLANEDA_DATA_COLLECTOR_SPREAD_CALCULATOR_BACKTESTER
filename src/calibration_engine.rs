@@ -4,7 +4,7 @@
 /// of prices and trades, and performs periodic recalibration of volatility (σ) and
 /// intensity parameters (κ, A).
 
-use crate::calibration::{calculate_volatility, fit_intensity_parameters, forecast_garch_volatility, OrderbookPoint};
+use crate::calibration::{calculate_volatility, fit_intensity_parameters, forecast_garch_volatility, CalibrationTrade, OrderbookPoint};
 use crate::data_loader::OrderbookSnapshot;
 use crate::model_types::{ASConfig, TradeEvent};
 use rust_decimal::Decimal;
@@ -18,15 +18,15 @@ const MIN_PRICES_FOR_CALIBRATION: usize = 10;
 pub struct CalibrationResult {
     /// Timestamp when calibration was performed
     pub timestamp: u64,
-    /// Volatility (sigma) as percentage (e.g., 0.02 = 2%)
+    /// Volatility (sigma) in units of 1/√seconds. σ²T is dimensionless.
     pub volatility: f64,
-    /// Intensity parameter kappa for bid side
+    /// Intensity decay kappa for bid side (dimensionless, calibrated in return space)
     pub bid_kappa: f64,
-    /// Intensity parameter A for bid side
+    /// Intensity scale A for bid side (trades per second at δ=0)
     pub bid_a: f64,
-    /// Intensity parameter kappa for ask side
+    /// Intensity decay kappa for ask side (dimensionless, calibrated in return space)
     pub ask_kappa: f64,
-    /// Intensity parameter A for ask side
+    /// Intensity scale A for ask side (trades per second at δ=0)
     pub ask_a: f64,
 }
 
@@ -40,8 +40,8 @@ pub struct CalibrationEngine {
     full_price_history: Vec<(u64, Decimal)>,
     /// Rolling window of orderbook exposure points for intensity fitting
     orderbook_points: Vec<OrderbookPoint>,
-    /// Rolling window of trades for intensity parameter fitting
-    window_trades: Vec<TradeEvent>,
+    /// Rolling window of trades for intensity parameter fitting (lightweight struct)
+    window_trades: Vec<CalibrationTrade>,
     /// Current kappa parameter for bid side
     bid_kappa: f64,
     /// Current A parameter for bid side
@@ -74,10 +74,10 @@ impl CalibrationEngine {
             full_price_history: Vec::with_capacity(estimated_prices),
             orderbook_points: Vec::with_capacity(estimated_prices),
             window_trades: Vec::with_capacity(estimated_trades),
-            bid_kappa: 10.0,  // Default starting value
-            bid_a: 100.0,     // Default starting value
-            ask_kappa: 10.0,  // Default starting value
-            ask_a: 100.0,     // Default starting value
+            bid_kappa: 100.0,  // Default starting value (dimensionless, in return space)
+            bid_a: 10.0,       // Default starting value (trades per second at δ=0)
+            ask_kappa: 100.0,  // Default starting value (dimensionless, in return space)
+            ask_a: 10.0,       // Default starting value (trades per second at δ=0)
             last_calibration_ts: None,
             calibration_window_ms,
             recalibration_interval_ms,
@@ -91,34 +91,42 @@ impl CalibrationEngine {
         self.full_price_history.push((timestamp, price));
     }
 
-    /// Add a full orderbook snapshot to the calibration window (captures exposure and mid)
+    /// Add a full orderbook snapshot to the calibration window (captures exposure and mid).
+    ///
+    /// Deltas are stored in return space (relative to mid) so that kappa is dimensionless.
     #[inline]
     pub fn add_orderbook(&mut self, snapshot: &OrderbookSnapshot, mid_price: Decimal) {
         let timestamp = snapshot.timestamp;
         self.calibration_prices.push((timestamp, mid_price));
         self.full_price_history.push((timestamp, mid_price));
 
+        let mid_f64 = mid_price.to_f64().unwrap_or(0.0);
+        if mid_f64 <= 0.0 {
+            return; // Can't compute return-space deltas without valid mid
+        }
+
         let best_bid = snapshot.bids.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
         let best_ask = snapshot.asks.first().map(|(p, _)| *p).unwrap_or(Decimal::ZERO);
         let far_bid = snapshot.bids.last().map(|(p, _)| *p).unwrap_or(best_bid);
         let far_ask = snapshot.asks.last().map(|(p, _)| *p).unwrap_or(best_ask);
 
+        // Compute deltas in return space: δ = |price - mid| / mid
         let bid_min = (mid_price - best_bid)
             .max(Decimal::ZERO)
             .to_f64()
-            .unwrap_or(0.0);
+            .unwrap_or(0.0) / mid_f64;
         let bid_max = (mid_price - far_bid)
             .max(Decimal::ZERO)
             .to_f64()
-            .unwrap_or(0.0);
+            .unwrap_or(0.0) / mid_f64;
         let ask_min = (best_ask - mid_price)
             .max(Decimal::ZERO)
             .to_f64()
-            .unwrap_or(0.0);
+            .unwrap_or(0.0) / mid_f64;
         let ask_max = (far_ask - mid_price)
             .max(Decimal::ZERO)
             .to_f64()
-            .unwrap_or(0.0);
+            .unwrap_or(0.0) / mid_f64;
 
         self.orderbook_points.push(OrderbookPoint {
             timestamp,
@@ -130,12 +138,17 @@ impl CalibrationEngine {
         });
     }
 
-    /// Add a trade to the calibration window
-    /// 
-    /// Note: Takes ownership of the trade. Clone before calling if you need to retain it.
+    /// Add a trade to the calibration window.
+    ///
+    /// Takes a reference and copies only the fields needed for calibration (timestamp, price,
+    /// is_buyer_maker), avoiding the need to clone the entire TradeEvent including quantity.
     #[inline]
-    pub fn add_trade(&mut self, trade: TradeEvent) {
-        self.window_trades.push(trade);
+    pub fn add_trade(&mut self, trade: &TradeEvent) {
+        self.window_trades.push(CalibrationTrade {
+            timestamp: trade.timestamp,
+            price: trade.price,
+            is_buyer_maker: trade.is_buyer_maker,
+        });
     }
 
     /// Prune old data from windows based on current timestamp
@@ -261,10 +274,10 @@ impl CalibrationEngine {
         self.full_price_history.clear();
         self.orderbook_points.clear();
         self.window_trades.clear();
-        self.bid_kappa = 10.0;
-        self.bid_a = 100.0;
-        self.ask_kappa = 10.0;
-        self.ask_a = 100.0;
+        self.bid_kappa = 100.0;  // Default (dimensionless, in return space)
+        self.bid_a = 10.0;
+        self.ask_kappa = 100.0;  // Default (dimensionless, in return space)
+        self.ask_a = 10.0;
         self.last_calibration_ts = None;
     }
 }

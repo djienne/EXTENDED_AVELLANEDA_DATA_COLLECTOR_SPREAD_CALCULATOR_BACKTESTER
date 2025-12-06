@@ -146,7 +146,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Add trades that occurred since last update
             while trade_idx < all_trades.len() && all_trades[trade_idx].timestamp <= current_ts {
-                calibration_engine.add_trade(all_trades[trade_idx].clone());
+                calibration_engine.add_trade(&all_trades[trade_idx]);
                 trade_idx += 1;
             }
 

@@ -41,13 +41,14 @@ fn round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     }
 }
 
+#[inline]
 pub fn compute_optimal_quote(
     timestamp: u64,
     mid_price: Decimal,
     inventory: Decimal,
-    sigma_pct_raw: f64, // per-second log-return volatility (dimensionless)
-    bid_kappa: f64,     // 1/price
-    ask_kappa: f64,     // 1/price
+    sigma_pct_raw: f64, // volatility in units of 1/√seconds (so σ²T is dimensionless)
+    bid_kappa: f64,     // intensity decay, dimensionless (calibrated in return space)
+    ask_kappa: f64,     // intensity decay, dimensionless (calibrated in return space)
     config: &ASConfig,
 ) -> OptimalQuote {
     let sigma_pct = clamp_sigma(sigma_pct_raw, config).max(0.0);
@@ -66,10 +67,10 @@ pub fn compute_optimal_quote(
     } else {
         0.0
     };
-    
-    // Gamma is treated as dimensionless; scale pricing terms via percentage domain.
+
+    // Gamma is dimensionless; all terms computed in return space.
     let gamma_constant = config.risk_aversion_gamma.max(MIN_GAMMA);
-    
+
     // Calculate gamma_from_shift in return space so gamma stays dimensionless
     let gamma_from_shift = {
         if sigma_sq > 1e-12 && t_horizon > 0.0 && mid_f64 > 0.0 {
@@ -98,20 +99,19 @@ pub fn compute_optimal_quote(
         gamma = gamma.clamp(min_g, max_g);
     }
 
-    // Convert kappa to return space so gamma/kappa is dimensionless
-    let bid_kappa_pct = if mid_f64 > 0.0 { bid_kappa * mid_f64 } else { bid_kappa };
-    let ask_kappa_pct = if mid_f64 > 0.0 { ask_kappa * mid_f64 } else { ask_kappa };
-
+    // Kappa is already dimensionless (calibrated in return space), no conversion needed.
     // Calculate separate bid and ask spreads using side-specific kappa values (all in return space)
     let vol_risk_term_ret = gamma * sigma_sq * t_horizon;
 
-    // Bid spread calculation
-    let bid_kappa_eff = if bid_kappa_pct > 0.0 { bid_kappa_pct } else { 10.0 };
+    // Bid spread calculation.
+    // Default kappa of 1.0 (dimensionless) gives reasonable spread when calibration fails.
+    // With γ=0.1, κ=1.0: spread term = (2/0.1)ln(1.1) ≈ 1.9 (as return fraction).
+    let bid_kappa_eff = if bid_kappa > 0.0 { bid_kappa } else { 1.0 };
     let bid_term = (1.0 + (gamma / bid_kappa_eff)).max(MIN_GAMMA);
     let bid_spread_ret = vol_risk_term_ret + (2.0 / gamma) * bid_term.ln();
 
-    // Ask spread calculation
-    let ask_kappa_eff = if ask_kappa_pct > 0.0 { ask_kappa_pct } else { 10.0 };
+    // Ask spread calculation (same default logic as bid)
+    let ask_kappa_eff = if ask_kappa > 0.0 { ask_kappa } else { 1.0 };
     let ask_term = (1.0 + (gamma / ask_kappa_eff)).max(MIN_GAMMA);
     let ask_spread_ret = vol_risk_term_ret + (2.0 / gamma) * ask_term.ln();
 
@@ -241,7 +241,8 @@ mod tests {
         let config = ASConfig::default();
         let mid = Decimal::from_str("100.0").unwrap();
         let q = Decimal::ZERO;
-        let quote = compute_optimal_quote(0, mid, q, 0.01, 10.0, 10.0, &config);
+        // kappa is now dimensionless (calibrated in return space)
+        let quote = compute_optimal_quote(0, mid, q, 0.01, 100.0, 100.0, &config);
         assert!(quote.bid_price < quote.ask_price);
         assert!(quote.optimal_spread > Decimal::ZERO);
     }
@@ -251,7 +252,8 @@ mod tests {
         let config = ASConfig::default();
         let mid = Decimal::from_str("100.0").unwrap();
         let inv = Decimal::from_str("5.0").unwrap();
-        let quote = compute_optimal_quote(0, mid, inv, 0.01, 10.0, 10.0, &config);
+        // kappa is now dimensionless (calibrated in return space)
+        let quote = compute_optimal_quote(0, mid, inv, 0.01, 100.0, 100.0, &config);
         // With positive inventory, reservation price should be below mid
         assert!(quote.reservation_price <= mid);
     }
@@ -260,7 +262,8 @@ mod tests {
     fn compute_quote_zero_volatility() {
         let config = ASConfig::default();
         let mid = Decimal::from_str("100.0").unwrap();
-        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.0, 10.0, 10.0, &config);
+        // kappa is now dimensionless (calibrated in return space)
+        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.0, 100.0, 100.0, &config);
         // Should still produce valid quotes even with zero volatility
         assert!(quote.bid_price <= quote.ask_price);
     }
@@ -270,7 +273,8 @@ mod tests {
         let mut config = ASConfig::default();
         config.gamma_max = 1e10; // Very high gamma max
         let mid = Decimal::from_str("100.0").unwrap();
-        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.01, 10.0, 10.0, &config);
+        // kappa is now dimensionless (calibrated in return space)
+        let quote = compute_optimal_quote(0, mid, Decimal::ZERO, 0.01, 100.0, 100.0, &config);
         // Should still produce valid quotes due to internal clamping
         assert!(quote.gamma <= MAX_GAMMA_LIMIT);
     }

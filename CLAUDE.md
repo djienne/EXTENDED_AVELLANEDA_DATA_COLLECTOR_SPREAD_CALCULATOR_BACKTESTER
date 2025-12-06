@@ -17,6 +17,10 @@ RUST_LOG=debug cargo run --bin collect_data
 # Backtesting (requires collected data)
 cargo run --bin backtest
 
+# Grid search optimization (parallel)
+cargo run --bin grid_search           # 1D: time horizons
+cargo run --bin grid_search_gamma     # 2D: horizons × gamma
+
 # Spread calculation
 cargo run --bin calculate_spread
 
@@ -34,9 +38,10 @@ cargo run --bin verify_orderbook
 **Key Modules**:
 - `websocket.rs` - WebSocket client for streaming orderbooks and trades
 - `storage/parquet_writer.rs` - Parquet writers with deduplication, state persistence, and partitioned files
-- `data_collector.rs` - Legacy CSV writers (deprecated, kept for backward compatibility)
 - `data_loader.rs` - Load historical data (supports both Parquet and legacy CSV formats)
 - `calibration.rs` - Volatility (σ) and side-specific intensity (κ_bid, A_bid, κ_ask, A_ask) parameter estimation
+- `calibration_engine.rs` - Stateful calibration with rolling windows and periodic recalibration
+- `backtest_engine.rs` - Reusable backtest logic for AS strategy (used by backtest and grid search)
 - `spread_model.rs` - AS optimal quote calculation with asymmetric spreads and inventory skew
 - `model_types.rs` - Configuration types for AS model (ASConfig, GammaMode, etc.)
 - `metrics.rs` - Performance tracking (PnL, Sharpe, fills, etc.)
@@ -45,6 +50,8 @@ cargo run --bin verify_orderbook
 
 - `src/bin/collect_data.rs` - Data collection service (WebSocket → Parquet)
 - `src/bin/backtest.rs` - Event-driven AS backtester with fill simulation
+- `src/bin/grid_search.rs` - 1D grid search over time horizons (parallel)
+- `src/bin/grid_search_gamma.rs` - 2D grid search over horizons × gamma (parallel)
 - `src/bin/calculate_spread.rs` - Optimal spread calculator
 - `src/bin/verify_orderbook.rs` - Orderbook data integrity checker
 
@@ -139,6 +146,12 @@ data/{market}/
 - `quote_validity_seconds`: Quote expiration time (default: 60)
 - `calibration_window_seconds`: Window for σ/κ calculation (default: 3600)
 - `recalibration_interval_seconds`: How often to recalibrate (default: 600)
+
+**Grid Search**:
+- `gamma_min`, `gamma_max`: Range for gamma grid search (default: 0.1, 5.0)
+- `gamma_grid_points`: Number of gamma values to test (default: 5)
+- `gamma_log_spacing`: Use logarithmic spacing for gamma grid (default: false)
+- `num_threads`: Parallel threads for grid search (default: 4)
 
 **Advanced**:
 - `gamma_mode`: "constant", "inventory_scaled", or "max_shift"
