@@ -198,7 +198,7 @@ where
     // Output file with buffered writer for better I/O performance
     let mut output_file: Option<BufWriter<File>> = if let Some(ref path) = output_csv_path {
         let file = File::create(path)?;
-        let mut writer = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
+        let mut writer = BufWriter::with_capacity(256 * 1024, file); // 256KB buffer for fewer syscalls
         writeln!(
             writer,
             "timestamp,datetime,mid_price,inventory,cash,pnl,spread_bps,bid_price,ask_price,bid_fills,ask_fills,gamma,bid_kappa,ask_kappa,bid_a,ask_a"
@@ -235,9 +235,8 @@ where
             DataEvent::Trade(trade) => {
                 let current_ts = trade.timestamp;
 
-                // Add trade to calibration engine
-                // TODO: If CalibrationEngine can accept &Trade, remove clone for better performance
-                calibration_engine.add_trade(trade.clone());
+                // Add trade to calibration engine (only copies needed fields, no full clone)
+                calibration_engine.add_trade(&trade);
 
                 // Skip trading if warming up (early exit for performance)
                 if current_ts < warmup_end_ts {

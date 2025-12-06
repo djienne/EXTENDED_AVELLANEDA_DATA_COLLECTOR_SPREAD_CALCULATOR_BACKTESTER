@@ -1,6 +1,14 @@
-use crate::model_types::TradeEvent;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::*;
+
+/// Lightweight trade data for calibration (excludes unused quantity field).
+/// Saves ~16 bytes per trade vs TradeEvent.
+#[derive(Debug, Clone)]
+pub struct CalibrationTrade {
+    pub timestamp: u64,
+    pub price: Decimal,
+    pub is_buyer_maker: bool,
+}
 
 // ============================================================================
 // Constants
@@ -18,15 +26,16 @@ const LOG_2PI: f64 = 1.837_877_066_409_345_3_f64;
 /// Minimum trades required for MLE estimation
 const MIN_TRADES_FOR_ESTIMATION: usize = 5;
 
-/// Default kappa when calibration fails
-const DEFAULT_KAPPA: f64 = 10.0;
+/// Default kappa when calibration fails (dimensionless, in return space).
+/// Value of 100 means fill rate decays by ~10% per 10 bps from mid.
+const DEFAULT_KAPPA: f64 = 100.0;
 
-/// Default A when calibration fails
+/// Default A when calibration fails (trades per second at δ=0)
 const DEFAULT_A: f64 = 10.0;
 
-/// Lower/upper bounds for kappa grid search
-const KAPPA_MIN: f64 = 1e-6;
-const KAPPA_MAX: f64 = 1e4;
+/// Lower/upper bounds for kappa grid search (dimensionless)
+const KAPPA_MIN: f64 = 1.0;
+const KAPPA_MAX: f64 = 1e6;
 
 /// Exposure over a single orderbook interval for one side
 #[derive(Debug, Clone)]
@@ -36,14 +45,21 @@ struct ExposureInterval {
     delta_max: f64,
 }
 
-/// Minimal orderbook information needed for intensity calibration
+/// Minimal orderbook information needed for intensity calibration.
+///
+/// All delta values are in return space (relative to mid), i.e., δ = |price - mid| / mid.
+/// This ensures kappa is calibrated as dimensionless directly.
 #[derive(Debug, Clone)]
 pub struct OrderbookPoint {
     pub timestamp: u64,
     pub mid: Decimal,
+    /// Minimum bid delta in return space: (mid - best_bid) / mid
     pub bid_min: f64,
+    /// Maximum bid delta in return space: (mid - far_bid) / mid
     pub bid_max: f64,
+    /// Minimum ask delta in return space: (best_ask - mid) / mid
     pub ask_min: f64,
+    /// Maximum ask delta in return space: (far_ask - mid) / mid
     pub ask_max: f64,
 }
 
@@ -97,8 +113,10 @@ fn collect_log_returns(prices: &[(u64, Decimal)]) -> Option<Vec<(f64, f64)>> {
     }
 }
 
-/// Calculate volatility (sigma) from price updates
-/// Returns volatility scaled to per-second using irregular sampling intervals
+/// Calculate volatility (sigma) from price updates.
+///
+/// Returns σ in units of 1/√seconds, computed as sqrt(Σr²/Σdt) where r are log-returns.
+/// This ensures σ²T is dimensionless when T is in seconds.
 pub fn calculate_volatility(prices: &[(u64, Decimal)]) -> f64 {
     let returns = match collect_log_returns(prices) {
         Some(r) => r,
@@ -285,6 +303,10 @@ fn build_fixed_step_returns(prices: &[(u64, Decimal)], step_seconds: f64) -> Opt
 
 /// Estimate intensity parameters kappa and A using a truncated exponential MLE.
 ///
+/// Fits the model λ(δ) = A·exp(-κδ) where δ is in return space (relative to mid).
+/// Therefore κ is dimensionless and can be used directly in the AS formula where
+/// γ/κ must also be dimensionless.
+///
 /// Combines trade deltas with per-snapshot exposure (delta_min, delta_max, duration)
 /// to account for the part of the book that could realistically fill.
 
@@ -348,8 +370,11 @@ fn build_side_exposures(
 }
 
 /// Collect trade deltas for a given side using the most recent orderbook point at each trade time.
+///
+/// Returns deltas in return space (relative to mid): δ = |trade_price - mid| / mid.
+/// This ensures kappa is calibrated as dimensionless.
 fn collect_trade_deltas(
-    trades: &[TradeEvent],
+    trades: &[CalibrationTrade],
     orderbooks: &[OrderbookPoint],
     is_bid: bool,
 ) -> Vec<f64> {
@@ -371,6 +396,12 @@ fn collect_trade_deltas(
         ob_idx = find_orderbook_index(orderbooks, trade.timestamp, ob_idx);
         let ob = &orderbooks[ob_idx];
 
+        // Compute delta in return space: δ = |trade_price - mid| / mid
+        let mid_f64 = ob.mid.to_f64().unwrap_or(0.0);
+        if mid_f64 <= 0.0 {
+            continue;
+        }
+
         let delta_dec = if is_bid {
             ob.mid - trade.price
         } else {
@@ -381,9 +412,10 @@ fn collect_trade_deltas(
             continue;
         }
 
-        if let Some(delta) = delta_dec.to_f64() {
-            if delta.is_finite() && delta > 0.0 {
-                deltas.push(delta);
+        if let Some(delta_price) = delta_dec.to_f64() {
+            let delta_ret = delta_price / mid_f64; // Convert to return space
+            if delta_ret.is_finite() && delta_ret > 0.0 {
+                deltas.push(delta_ret);
             }
         }
     }
@@ -497,17 +529,20 @@ fn estimate_mle_side_exposure(
     Some((best_kappa, a))
 }
 
-/// Calibrates intensity parameters A and kappa using MLE on trade arrival rates
+/// Calibrates intensity parameters A and kappa using MLE on trade arrival rates.
+///
+/// Fits λ(δ) = A·exp(-κδ) for each side, where δ is in return space (relative to mid).
+/// Kappa is dimensionless and can be used directly in the AS spread formula.
 ///
 /// # Arguments
 /// * `trades` - List of trades in the window
-/// * `orderbooks` - Rolling orderbook points (timestamp, deltas) sorted by timestamp
+/// * `orderbooks` - Rolling orderbook points (timestamp, deltas in return space) sorted by timestamp
 /// * `window_end_ts` - End timestamp (ms) of the calibration window
 ///
 /// # Returns
-/// Tuple of (bid_kappa, bid_a, ask_kappa, ask_a) parameters
+/// Tuple of (bid_kappa, bid_a, ask_kappa, ask_a) where kappa is dimensionless
 pub fn fit_intensity_parameters(
-    trades: &[TradeEvent],
+    trades: &[CalibrationTrade],
     orderbooks: &[OrderbookPoint],
     window_end_ts: u64,
 ) -> (f64, f64, f64, f64) {
@@ -683,37 +718,37 @@ mod tests {
         // Build synthetic trades hitting both sides
         let mut trades = Vec::new();
         for i in 0..5 {
-            trades.push(TradeEvent {
+            trades.push(CalibrationTrade {
                 timestamp: 1_000 + i * 200,
                 price: Decimal::from_str("99.9").unwrap(),
-                quantity: Decimal::ONE,
                 is_buyer_maker: true, // hits bid
             });
-            trades.push(TradeEvent {
+            trades.push(CalibrationTrade {
                 timestamp: 2_000 + i * 200,
                 price: Decimal::from_str("100.1").unwrap(),
-                quantity: Decimal::ONE,
                 is_buyer_maker: false, // hits ask
             });
         }
 
         // Two orderbook snapshots covering the window
+        // Deltas are in return space (relative to mid)
+        // Trade at 99.9 with mid=100 has delta_ret = 0.1/100 = 0.001 (10 bps)
         let orderbooks = vec![
             OrderbookPoint {
                 timestamp: 0,
                 mid: Decimal::from_str("100").unwrap(),
-                bid_min: 0.05,
-                bid_max: 1.0,
-                ask_min: 0.05,
-                ask_max: 1.0,
+                bid_min: 0.0005,  // 5 bps from mid (best bid at 99.95)
+                bid_max: 0.01,    // 100 bps from mid (far bid at 99.0)
+                ask_min: 0.0005,  // 5 bps from mid (best ask at 100.05)
+                ask_max: 0.01,    // 100 bps from mid (far ask at 101.0)
             },
             OrderbookPoint {
                 timestamp: 4_000,
                 mid: Decimal::from_str("100").unwrap(),
-                bid_min: 0.04,
-                bid_max: 0.8,
-                ask_min: 0.04,
-                ask_max: 0.8,
+                bid_min: 0.0004,  // 4 bps from mid
+                bid_max: 0.008,   // 80 bps from mid
+                ask_min: 0.0004,
+                ask_max: 0.008,
             },
         ];
 
