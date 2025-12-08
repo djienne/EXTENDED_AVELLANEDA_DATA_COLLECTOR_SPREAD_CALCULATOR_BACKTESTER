@@ -20,6 +20,50 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use chrono::{DateTime, Utc};
+use std::time::{Duration, Instant};
+
+/// Profiling statistics to identify hot paths
+#[derive(Debug, Default)]
+struct ProfilingStats {
+    data_loading: Duration,
+    calibration_update: Duration,
+    calibration_compute: Duration,
+    strategy_logic: Duration,
+    csv_io: Duration,
+    total_events: u64,
+}
+
+impl ProfilingStats {
+    fn print_summary(&self, total_duration: Duration) {
+        println!("\n{:=<60}", "");
+        println!("PROFILING STATISTICS");
+        println!("{:=<60}", "");
+        
+        let total_micros = total_duration.as_micros().max(1) as f64;
+        
+        let print_metric = |name: &str, duration: Duration| {
+            let micros = duration.as_micros() as f64;
+            let pct = (micros / total_micros) * 100.0;
+            println!("{:<20} | {:>10.3} ms | {:>6.2}%", name, duration.as_secs_f64() * 1000.0, pct);
+        };
+        
+        print_metric("Data Loading", self.data_loading);
+        print_metric("Calib Update", self.calibration_update);
+        print_metric("Calib Compute", self.calibration_compute);
+        print_metric("Strategy Logic", self.strategy_logic);
+        print_metric("CSV I/O", self.csv_io);
+        
+        let measured_total = self.data_loading + self.calibration_update + 
+                             self.calibration_compute + self.strategy_logic + self.csv_io;
+        let overhead = total_duration.saturating_sub(measured_total);
+        print_metric("Overhead/Other", overhead);
+        
+        println!("{:-<60}", "");
+        println!("{:<20} | {:>10.3} ms | {:>6.2}%", "TOTAL", total_duration.as_secs_f64() * 1000.0, 100.0);
+        println!("Total Events Processed: {}", self.total_events);
+        println!("{:=<60}\n", "");
+    }
+}
 
 /// Precomputed constants to avoid repeated Decimal conversions
 struct DecimalConstants {
@@ -228,7 +272,15 @@ where
     // Track if we need to output (reduces conditional checks)
     let needs_csv = output_file.is_some();
 
+    // Profiling
+    let mut stats = ProfilingStats::default();
+    let overall_start = Instant::now();
+    let mut last_iter_time = Instant::now();
+
     for event_result in data_stream {
+        // Measure data loading (time since last iteration finished)
+        stats.data_loading += last_iter_time.elapsed();
+        stats.total_events += 1;
         let event = event_result?;
 
         match event {
@@ -236,7 +288,10 @@ where
                 let current_ts = trade.timestamp;
 
                 // Add trade to calibration engine (only copies needed fields, no full clone)
+                // Add trade to calibration engine (only copies needed fields, no full clone)
+                let t0 = Instant::now();
                 calibration_engine.add_trade(&trade);
+                stats.calibration_update += t0.elapsed();
 
                 // Skip trading if warming up (early exit for performance)
                 if current_ts < warmup_end_ts {
@@ -347,12 +402,19 @@ where
                 last_mid = mid_price;
 
                 // Calibration & Quoting for NEXT interval
+                let t_cal_up = Instant::now();
                 calibration_engine.add_orderbook(&quote, mid_price);
                 calibration_engine.prune_windows(current_ts);
+                stats.calibration_update += t_cal_up.elapsed();
 
                 // Check if we should recalibrate
                 if calibration_engine.should_recalibrate(current_ts) {
-                    if let Some(cal_result) = calibration_engine.calibrate(current_ts, config.tick_size) {
+                    let t_cal_comp = Instant::now();
+                    let cal_option = calibration_engine.calibrate(current_ts, config.tick_size);
+                    stats.calibration_compute += t_cal_comp.elapsed();
+
+                    if let Some(cal_result) = cal_option {
+                        let t_strat = Instant::now();
                         let optimal = compute_optimal_quote(
                             current_ts,
                             mid_price,
@@ -367,9 +429,11 @@ where
                         active_bid_price = Some(optimal.bid_price);
                         active_ask_price = Some(optimal.ask_price);
                         active_quote_ts = current_ts;
+                        
+                        stats.strategy_logic += t_strat.elapsed();
 
                         // Only compute display values when actually needed
-                        let should_print = verbose && row_count % 10 == 0;
+                        let should_print = verbose && row_count.is_multiple_of(10);
                         
                         if needs_csv || should_print {
                             let pnl = state.mark_to_market_pnl(mid_price);
@@ -382,6 +446,7 @@ where
 
                             // Write to CSV if enabled
                             if let Some(ref mut writer) = output_file {
+                                let t_io = Instant::now();
                                 let inventory_display = state.inventory.round_dp(6);
                                 if let Err(e) = writeln!(
                                     writer,
@@ -405,6 +470,7 @@ where
                                 ) {
                                     eprintln!("Warning: Failed to write to CSV: {}", e);
                                 }
+                                stats.csv_io += t_io.elapsed();
                             }
 
                             if should_print {
@@ -420,7 +486,15 @@ where
                 }
             }
         }
+
+
+        
+        
+        last_iter_time = Instant::now();
     }
+    
+    // Print stats
+    stats.print_summary(overall_start.elapsed());
 
     // Flush the buffered writer before closing
     if let Some(ref mut writer) = output_file {
@@ -474,3 +548,4 @@ where
         config,
     })
 }
+

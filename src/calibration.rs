@@ -269,7 +269,7 @@ fn build_fixed_step_returns(prices: &[(u64, Decimal)], step_seconds: f64) -> Opt
             next_bucket = next_bucket.saturating_add(step_ms);
         }
         // Update last price at the current sample
-        current_ts = ts;
+
         last_price = price;
     }
 

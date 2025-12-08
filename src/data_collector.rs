@@ -8,8 +8,8 @@
 /// - Backward compatibility with existing code
 /// - Migration utilities
 /// - Testing purposes
-///
-/// For new code, use `OrderbookParquetWriter` and `TradesParquetWriter` instead.
+
+// For new code, use `OrderbookParquetWriter` and `TradesParquetWriter` instead.
 
 use crate::error::Result;
 use crate::types::{PublicTrade, WsOrderBookMessage};
@@ -23,7 +23,7 @@ use std::cmp::Reverse;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
+
 use std::str::FromStr;
 
 /// State tracking for resuming data collection
@@ -475,7 +475,7 @@ impl OrderbookCsvWriter {
                     // Return error to trigger reconnection at the collect_data level
                     return Err(crate::error::ConnectorError::ApiError(
                         format!("Sequence gap detected: expected {}, got {}", prev_seq + 1, msg.seq)
-                    ).into());
+                    ));
                 }
             }
         }
@@ -532,8 +532,8 @@ impl OrderbookCsvWriter {
         }
 
         // Debug: Log first few levels to verify sorting (ALWAYS log first 10 updates for debugging)
-        if state.orderbook_updates_count < 10 || state.orderbook_updates_count % 100 == 0 {
-            if !msg.data.b.is_empty() && !msg.data.a.is_empty() {
+        if (state.orderbook_updates_count < 10 || state.orderbook_updates_count % 100 == 0)
+            && !msg.data.b.is_empty() && !msg.data.a.is_empty() {
                 info!("Orderbook levels for {} (seq {}):", msg.data.m, msg.seq);
                 info!("  Bids (should be descending): {}",
                     msg.data.b.iter().take(5).map(|b| format!("{}@{}", b.q, b.p)).collect::<Vec<_>>().join(", "));
@@ -550,7 +550,6 @@ impl OrderbookCsvWriter {
                      msg.data.a.first().unwrap().p.parse::<f64>().unwrap_or(0.0)) / 2.0
                 );
             }
-        }
 
         let best_bid_opt = msg.data.b.first();
         let best_ask_opt = msg.data.a.first();
@@ -773,7 +772,7 @@ impl FullOrderbookCsvWriter {
                     // Return error to trigger reconnection at the collect_data level
                     return Err(crate::error::ConnectorError::ApiError(
                         format!("Sequence gap detected: expected {}, got {}", prev_seq + 1, msg.seq)
-                    ).into());
+                    ));
                 }
             }
         }

@@ -119,7 +119,7 @@ pub async fn run_data_collection_task(
             while let Some(msg) = rx.recv().await {
 
                 // Debug: log message type and first update
-                if orderbook_state.seq == 0 || orderbook_state.seq % 100 == 0 {
+                if orderbook_state.seq == 0 || orderbook_state.seq.is_multiple_of(100) {
                     info!("Received {} message (seq={}), bids={}, asks={}",
                           msg.message_type, msg.seq, msg.data.b.len(), msg.data.a.len());
                 }
@@ -128,7 +128,7 @@ pub async fn run_data_collection_task(
                 orderbook_state.apply_update(&msg);
 
                 // Debug: log orderbook state after update
-                if orderbook_state.seq % 100 == 0 {
+                if orderbook_state.seq.is_multiple_of(100) {
                     info!("Orderbook state: {} bid levels, {} ask levels",
                           orderbook_state.bids.len(), orderbook_state.asks.len());
                 }

@@ -62,8 +62,8 @@ impl CalibrationEngine {
     /// Create a new calibration engine
     pub fn new(config: &ASConfig) -> Self {
         // Cast before multiply to prevent overflow
-        let calibration_window_ms = (config.calibration_window_seconds as u64).saturating_mul(1000);
-        let recalibration_interval_ms = (config.recalibration_interval_seconds as u64).saturating_mul(1000);
+        let calibration_window_ms = config.calibration_window_seconds.saturating_mul(1000);
+        let recalibration_interval_ms = config.recalibration_interval_seconds.saturating_mul(1000);
 
         // Estimate capacity: ~1 price per second for the window duration
         let estimated_prices = (config.calibration_window_seconds as usize).min(10_000);

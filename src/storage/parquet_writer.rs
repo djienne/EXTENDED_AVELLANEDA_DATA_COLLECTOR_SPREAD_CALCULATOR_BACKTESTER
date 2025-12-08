@@ -193,7 +193,7 @@ impl OrderbookParquetWriter {
     pub async fn write_full_orderbook(&self, msg: &WsOrderBookMessage) -> Result<()> {
         // Scoped lock for deduplication and state checks
         let should_process = {
-            let mut last_seq = self.last_seq.lock().await;
+            let last_seq = self.last_seq.lock().await;
             let state = self.state.lock().await;
 
             // Log message type for debugging
@@ -241,8 +241,7 @@ impl OrderbookParquetWriter {
                             "Sequence gap detected: expected {}, got {}",
                             prev_seq + 1,
                             msg.seq
-                        ))
-                        .into());
+                        )));
                     }
                 }
             }
@@ -413,8 +412,7 @@ impl OrderbookParquetWriter {
             // Close current writer if exists
             if let Some(writer) = writer_lock.take() {
                 writer.close().map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         format!("Failed to close writer: {}", e),
                     )
                 })?;
@@ -470,8 +468,7 @@ impl OrderbookParquetWriter {
 
             let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
                 .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         format!("Failed to create writer: {}", e),
                     )
                 })?;
@@ -492,15 +489,13 @@ impl OrderbookParquetWriter {
 
         if let Some(writer) = writer_lock.as_mut() {
             writer.write(&record_batch).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("Failed to write batch: {}", e),
                 )
             })?;
 
             writer.flush().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("Failed to flush writer: {}", e),
                 )
             })?;
@@ -610,8 +605,7 @@ impl OrderbookParquetWriter {
         }
 
         RecordBatch::try_new(Arc::new(schema.clone()), columns).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("Failed to create RecordBatch: {}", e),
             )
             .into()
@@ -655,8 +649,7 @@ impl OrderbookParquetWriter {
         if let Some(writer) = writer_lock.take() {
             let file_rows = *self.current_file_rows.lock().await;
             writer.close().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("Failed to close writer: {}", e),
                 )
             })?;
@@ -892,8 +885,7 @@ impl TradesParquetWriter {
             // Close current writer if exists
             if let Some(writer) = writer_lock.take() {
                 writer.close().map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         format!("Failed to close writer: {}", e),
                     )
                 })?;
@@ -945,8 +937,7 @@ impl TradesParquetWriter {
 
             let new_writer = ArrowWriter::try_new(file, Arc::new(schema.clone()), Some(props))
                 .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    std::io::Error::other(
                         format!("Failed to create writer: {}", e),
                     )
                 })?;
@@ -963,15 +954,13 @@ impl TradesParquetWriter {
 
         if let Some(writer) = writer_lock.as_mut() {
             writer.write(&record_batch).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("Failed to write batch: {}", e),
                 )
             })?;
 
             writer.flush().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("Failed to flush writer: {}", e),
                 )
             })?;
@@ -1017,8 +1006,7 @@ impl TradesParquetWriter {
         ];
 
         RecordBatch::try_new(Arc::new(schema.clone()), columns).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 format!("Failed to create RecordBatch: {}", e),
             )
             .into()
@@ -1053,8 +1041,7 @@ impl TradesParquetWriter {
         if let Some(writer) = writer_lock.take() {
             let file_rows = *self.current_file_rows.lock().await;
             writer.close().map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                std::io::Error::other(
                     format!("Failed to close writer: {}", e),
                 )
             })?;

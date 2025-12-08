@@ -1,12 +1,11 @@
+#![allow(clippy::result_large_err)]
 use extended_data_collector::types::WsOrderBookMessage;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use rust_decimal::Decimal;
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, tungstenite::client::IntoClientRequest};
-use url::Url;
 
 const MARKET: &str = "SOL-USD";
 const WS_URL: &str = "wss://api.starknet.extended.exchange/v1/stream"; // Based on docs: wss://api.starknet.extended.exchange/stream.extended.exchange/v1 ?
@@ -144,8 +143,8 @@ async fn main() {
                             print_top_levels("Fresh SNAPSHOT", &snapshot_ob);
                             compare_orderbooks(&delta_ob, &snapshot_ob);
                         }
-                    } else if parsed.message_type == "DELTA" {
-                        if first_snapshot_received {
+                    } else if parsed.message_type == "DELTA"
+                        && first_snapshot_received {
                             delta_ob.apply_delta(&parsed);
                             delta_count += 1;
                             if delta_count % 100 == 0 {
@@ -156,7 +155,6 @@ async fn main() {
                                 print_top_levels(&format!("Delta OB at {}", delta_count), &delta_ob);
                             }
                         }
-                    }
                 }
             }
             Ok(Message::Ping(_)) => {} // Auto-handled usually, but good to ignore
@@ -192,7 +190,7 @@ fn compare_orderbooks(delta: &Orderbook, snapshot: &Orderbook) {
             }
         }
     }
-    for (price, _) in &delta.bids {
+    for price in delta.bids.keys() {
         if !snapshot.bids.contains_key(price) {
             println!("FAILURE: Extra Bid in Delta at {}", price);
             consistent = false;
@@ -218,7 +216,7 @@ fn compare_orderbooks(delta: &Orderbook, snapshot: &Orderbook) {
             }
         }
     }
-    for (price, _) in &delta.asks {
+    for price in delta.asks.keys() {
         if !snapshot.asks.contains_key(price) {
             println!("FAILURE: Extra Ask in Delta at {}", price);
             consistent = false;

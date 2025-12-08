@@ -41,6 +41,7 @@ fn round_up_to_tick(price: Decimal, tick: Decimal) -> Decimal {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn compute_optimal_quote(
     timestamp: u64,

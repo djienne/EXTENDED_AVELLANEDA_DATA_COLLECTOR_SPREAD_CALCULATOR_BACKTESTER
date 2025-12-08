@@ -57,6 +57,15 @@ data/*/backtest_results.csv
 data/*/gaps.csv
 data/*/grid_search_2d_results.csv
 
+# Trade Parquet parts
+data/*/trades_parts/
+
+# Backtest and profile outputs
+backtest_profile.txt
+backtest_output.txt
+backtest_gap_*.txt
+check_output.txt
+
 # Test compression artifacts
 test_compression/
 

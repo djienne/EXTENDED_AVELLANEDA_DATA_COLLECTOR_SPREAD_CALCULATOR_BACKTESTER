@@ -1,13 +1,13 @@
-/// Parallel 2D grid search over time horizons AND gamma values for AS market-making backtest
-///
-/// Tests multiple combinations of inventory_horizon_seconds and risk_aversion_gamma
-/// using parallel threads for faster execution.
-///
-/// Gamma (risk aversion) interpretation:
-/// - 0.01: Very risk-tolerant, minimal inventory penalty
-/// - 0.05: Low risk aversion, allows significant inventory
-/// - 0.10: Moderate risk aversion (typical default)
-/// - 0.20: High risk aversion, strong inventory penalty
+// Parallel 2D grid search over time horizons AND gamma values for AS market-making backtest
+//
+// Tests multiple combinations of inventory_horizon_seconds and risk_aversion_gamma
+// using parallel threads for faster execution.
+//
+// Gamma (risk aversion) interpretation:
+// - 0.01: Very risk-tolerant, minimal inventory penalty
+// - 0.05: Low risk aversion, allows significant inventory
+// - 0.10: Moderate risk aversion (typical default)
+// - 0.20: High risk aversion, strong inventory penalty
 
 use extended_data_collector::backtest_engine::{run_backtest, BacktestParams, BacktestResults};
 use extended_data_collector::data_loader::DataLoader;
